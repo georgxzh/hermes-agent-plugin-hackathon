@@ -1,0 +1,6 @@
+name: hello_hackathon
+version: 0.1.0
+description: Minimal hackathon plugin that registers a single greeting tool
+author: georg
+provides_tools:
+  - hello_hackathon

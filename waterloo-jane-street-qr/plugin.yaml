@@ -1,0 +1,11 @@
+name: waterloo-jane-street-qr
+version: "1.0.0"
+description: "Jane Street / Citadel style quantitative research assistant by a Waterloo IMO/ICPC/Putnam intern."
+entrypoint: "__init__.py"
+author: georg
+license: MIT
+tags: [quant, finance, options, probability, market-microstructure]
+provides_tools:
+  - black_scholes
+  - ev_calculator
+  - order_book_metrics
