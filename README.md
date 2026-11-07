@@ -1,4 +1,4 @@
-# waterloo-jane-street-qr
+# Waterloo-Jane-Street-QR
 
 **A math-first quantitative research and trading-interview assistant, packaged as a [Hermes Agent](https://github.com/NousResearch/hermes-agent) v0.22.7 plugin.**
 
