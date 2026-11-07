@@ -14,6 +14,7 @@ import random
 import re
 import sys
 import time
+import itertools  # noqa: F401  (used by brute-force checks)
 import traceback
 from fractions import Fraction
 
@@ -57,6 +58,18 @@ def exact(field, want: str):
 
 BASE = dict(spot=100, strike=100, time_to_maturity=1, risk_free_rate=0.05, volatility=0.2)
 
+try:  # pytest is optional; the standalone runner understands Skip too
+    import pytest as _pytest
+    Skip = _pytest.skip.Exception
+except ImportError:  # pragma: no cover
+    class Skip(Exception):
+        pass
+
+
+def need_numpy():
+    if m._np is None:
+        raise Skip("NumPy not installed (pure-Python backend tested instead)")
+
 
 # ════════════════════════════════════════════════════════════════════════
 # Registration, manifest, persona & enforcement
@@ -84,7 +97,8 @@ class FakeCtx:
 EXPECTED_TOOLS = {
     "black_scholes", "binomial_tree_american", "heston_price", "monte_carlo_engine", "ev_calculator",
     "optimal_stopping", "matrix_game_solver", "order_book_metrics", "avellaneda_stoikov_quotes",
-    "order_flow_toxicity",
+    "order_flow_toxicity", "almgren_chriss_liquidation", "longstaff_schwartz_american",
+    "black_litterman_optimizer", "jane_street_ev_trainer",
 }
 
 
@@ -169,7 +183,7 @@ def test_legacy_host_fallback():
 
     ctx = OldCtx()
     m.register(ctx)
-    assert len(ctx.tools) == 10 and ctx.hooks[0][0] == "pre_llm_call"
+    assert len(ctx.tools) == len(EXPECTED_TOOLS) and ctx.hooks[0][0] == "pre_llm_call"
     assert ctx.hooks[0][1]()["context"] == m.PERSONA_PROMPT
 
 
@@ -733,6 +747,505 @@ def test_order_book_metrics():
 
 
 # ════════════════════════════════════════════════════════════════════════
+# Almgren-Chriss
+# ════════════════════════════════════════════════════════════════════════
+
+AC = dict(shares=1e6, horizon=5, periods=5, volatility=0.3 * 50 / math.sqrt(250), permanent_impact=2.5e-7,
+          temporary_impact=2.5e-6, fixed_cost=0.0625, risk_aversion=1e-6, spot=50)
+
+
+def _ac_utility(x, a):
+    tau = a["horizon"] / a["periods"]
+    eta_t = a["temporary_impact"] - 0.5 * a["permanent_impact"] * tau
+    n = [x[k - 1] - x[k] for k in range(1, len(x))]
+    E = 0.5 * a["permanent_impact"] * x[0] ** 2 + a["fixed_cost"] * sum(abs(v) for v in n) + eta_t / tau * sum(v * v for v in n)
+    V = a["volatility"] ** 2 * tau * sum(v * v for v in x[1:])
+    return E, V, E + a["risk_aversion"] * V
+
+
+def test_ac_paper_example_closed_form():
+    r = call(m.almgren_chriss_liquidation, **AC)
+    tau, eta_t = 1.0, 2.5e-6 - 0.5 * 2.5e-7
+    kt2 = 1e-6 * AC["volatility"] ** 2 / eta_t
+    kappa = math.acosh(1 + 0.5 * kt2 * tau * tau) / tau
+    approx(r["derived"]["kappa"], kappa, 1e-12)
+    approx(kappa, 0.6063, 1e-4)                                   # AC (2000): kappa ~ 0.6 / day
+    x = [s["holdings"] for s in r["schedule"]]
+    for k, xk in enumerate(x):                                    # independent sinh formula
+        approx(xk, 1e6 * math.sinh(kappa * (5 - k)) / math.sinh(kappa * 5), 1e-6)
+    E, V, U = _ac_utility(x, AC)
+    approx(r["optimal"]["expected_cost"], E, 1e-6)
+    approx(r["optimal"]["variance"], V, 1e-3)
+    approx(r["benchmarks"]["twap"]["expected_cost"], 662_500.0, 1e-6)   # 125000 + 62500 + 475000
+    assert r["optimality_certificate"]["euler_lagrange_max_rel_residual"] < 1e-12
+    assert r["optimality_certificate"]["beats_twap"] and r["optimality_certificate"]["beats_immediate"]
+    approx(r["optimal"]["expected_cost_bps"], E / (1e6 * 50) * 1e4, 1e-9)
+
+
+def test_ac_risk_neutral_twap_and_urgency_monotone():
+    r0 = call(m.almgren_chriss_liquidation, **{**AC, "risk_aversion": 0})
+    assert [round(s["holdings"]) for s in r0["schedule"]] == [1_000_000, 800_000, 600_000, 400_000, 200_000, 0]
+    prev = None
+    for lam in (1e-8, 1e-7, 1e-6, 1e-5):
+        r = call(m.almgren_chriss_liquidation, **{**AC, "risk_aversion": lam})
+        cur = (r["pct_executed_first_half"], r["optimal"]["expected_cost"], r["optimal"]["variance"])
+        if prev:
+            assert cur[0] > prev[0] and cur[1] > prev[1] and cur[2] < prev[2]   # more urgency: E up, V down
+        prev = cur
+    f = r["efficient_frontier"]
+    assert all(a["expected_cost"] >= b["expected_cost"] - 1e-6 for a, b in zip(f, f[1:]))  # sorted by std
+
+
+def test_ac_optimum_beats_random_perturbations():
+    a = {**AC, "periods": 20, "horizon": 5}
+    r = call(m.almgren_chriss_liquidation, **a, max_schedule_rows=1000)
+    x = [s["holdings"] for s in r["schedule"]]
+    U0 = _ac_utility(x, a)[2]
+    rng = random.Random(9)
+    for _ in range(200):
+        y = x[:]
+        for k in range(1, len(y) - 1):
+            y[k] = min(max(y[k] + rng.gauss(0, 5_000), 0), 1e6)
+        assert _ac_utility(y, a)[2] > U0
+
+
+def test_ac_monte_carlo_shortfall_matches_mean_variance():
+    """Simulate the AC price process directly; shortfall mean/variance must match E and V."""
+    r = call(m.almgren_chriss_liquidation, **AC)
+    x = [s["holdings"] for s in r["schedule"]]
+    n = [x[k - 1] - x[k] for k in range(1, len(x))]
+    rng = random.Random(4)
+    S0, sig, gam, eta, eps = 50.0, AC["volatility"], 2.5e-7, 2.5e-6, 0.0625
+    sf = []
+    for _ in range(20000):
+        S, cash = S0, 0.0
+        for nk in n:
+            cash += nk * (S - eps - eta * nk)                    # sale at S_{k-1} - h(n_k / tau), tau = 1
+            S += sig * rng.gauss(0, 1) - gam * nk                # S_k = S_{k-1} + sigma xi - gamma n_k
+        sf.append(1e6 * S0 - cash)
+    mean = sum(sf) / len(sf)
+    var = sum((v - mean) ** 2 for v in sf) / (len(sf) - 1)
+    assert abs(mean - r["optimal"]["expected_cost"]) < 4 * math.sqrt(var / len(sf))
+    approx(var, r["optimal"]["variance"], rel=0.05)
+
+
+def test_ac_buy_side_alias_and_errors():
+    sell = call(m.almgren_chriss_liquidation, **AC)
+    buy = call(m.almgren_chriss_liquidation, **{**AC, "shares": -1e6})
+    approx(buy["optimal"]["expected_cost"], sell["optimal"]["expected_cost"], 1e-6)
+    assert buy["side"].startswith("buy")
+    alias = {k: v for k, v in AC.items() if k != "permanent_impact"}
+    kl = call(m.almgren_chriss_liquidation, **alias, kyle_lambda=2.5e-7)
+    approx(kl["optimal"]["utility"], sell["optimal"]["utility"], 1e-6)
+    call_err(m.almgren_chriss_liquidation, {**AC, "kyle_lambda": 1e-7})              # both aliases
+    call_err(m.almgren_chriss_liquidation, {**AC, "shares": 0})
+    err = call_err(m.almgren_chriss_liquidation, {**AC, "temporary_impact": 1e-7})   # eta_tilde <= 0
+    assert "eta_tilde" in err
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Longstaff-Schwartz
+# ════════════════════════════════════════════════════════════════════════
+
+LS = dict(spot=36, strike=40, time_to_maturity=1, risk_free_rate=0.06, volatility=0.2, exercise_dates=50)
+LS_BERMUDAN = 4.478015  # CRR, 2000 steps, exercise every 40th step (converged: 4.4792 / 4.4784 / 4.4780)
+
+
+def test_lsm_python_backend_longstaff_schwartz_table1():
+    r = call(m.longstaff_schwartz_american, **LS, backend="python", paths=20000, boundary_points=0)
+    assert r["backend"] == "python"
+    approx(r["benchmarks"]["bermudan_crr"], LS_BERMUDAN, 2e-3)
+    assert abs(r["price"] - LS_BERMUDAN) < 4 * r["std_error"] + 0.02
+    ins = r["estimators"]["in_sample"]["price"]
+    assert abs(ins - LS_BERMUDAN) < 0.05                       # LS (2001) report 4.472 (s.e. 0.010)
+    assert r["price"] > r["benchmarks"]["european_black_scholes"] + 0.5
+    assert 0.5 < r["early_exercise"]["probability_before_maturity"] < 0.9
+    # European CV helps little for an ITM American put (early exercise decorrelates the payoffs): ~1.1x here
+    assert r["estimators"]["out_of_sample"]["control_variate"]["variance_reduction_factor"] >= 1.0
+
+
+def test_lsm_numpy_backend_and_low_bias():
+    need_numpy()
+    oos = []
+    for seed in range(6):
+        r = call(m.longstaff_schwartz_american, **LS, paths=50000, seed=seed, benchmark=False, boundary_points=0)
+        assert r["backend"].startswith("numpy")
+        oos.append(r["estimators"]["out_of_sample"]["price"])
+    mean = sum(oos) / 6
+    sd = math.sqrt(sum((v - mean) ** 2 for v in oos) / 5)
+    assert abs(mean - LS_BERMUDAN) < 0.015
+    assert mean < LS_BERMUDAN + 3 * sd / math.sqrt(6)          # out-of-sample policy value is low-biased
+
+
+def test_lsm_backends_agree():
+    need_numpy()
+    py = call(m.longstaff_schwartz_american, **LS, backend="python", paths=20000, benchmark=False, boundary_points=0)
+    nv = call(m.longstaff_schwartz_american, **LS, backend="numpy", paths=100000, benchmark=False, boundary_points=0)
+    assert abs(py["price"] - nv["price"]) < 4 * math.hypot(py["std_error"], nv["std_error"]) + 0.02
+
+
+def test_lsm_boundary_tracks_crr():
+    r = call(m.longstaff_schwartz_american, **LS, backend="python", paths=20000, boundary_points=10)
+    crr = m._crr_tree(36, 40, 1, 0.06, 0, 0.2, 1000, "put")["boundary"]
+    pts = [p for p in r["exercise_boundary"]["points"] if p["critical_spot"] is not None and p["time"] > 0.2]
+    assert len(pts) >= 6
+    for p in pts:
+        ref = crr[round(p["time"] * 1000)]
+        assert p["critical_spot"] < 40 and abs(p["critical_spot"] - ref) < 1.5, (p, ref)
+
+
+def test_lsm_call_without_dividends_is_european():
+    r = call(m.longstaff_schwartz_american, **{**BASE, "option_type": "call", "exercise_dates": 25},
+             backend="python", paths=20000, boundary_points=0)
+    bs = r["benchmarks"]["european_black_scholes"]
+    assert abs(r["price"] - bs) < 4 * r["std_error"] + 0.03
+    assert r["early_exercise"]["probability_before_maturity"] < 0.02
+
+
+def test_lsm_bases_and_determinism():
+    kw = {**LS, "exercise_dates": 20, "backend": "python", "paths": 8000, "benchmark": False, "boundary_points": 0}
+    a = call(m.longstaff_schwartz_american, **kw)
+    assert a["price"] == call(m.longstaff_schwartz_american, **kw)["price"]
+    for basis in ("monomial", "laguerre_unweighted"):
+        b = call(m.longstaff_schwartz_american, **{**kw, "basis": basis})
+        assert abs(b["price"] - a["price"]) < 0.05, basis
+
+
+def test_lsm_errors_and_backend_fallback():
+    call_err(m.longstaff_schwartz_american, {**LS, "paths": 5_000_000, "exercise_dates": 500})
+    call_err(m.longstaff_schwartz_american, {**LS, "degree": 9})
+    call_err(m.longstaff_schwartz_american, {**LS, "basis": "hermite"})
+    if m._np is None:
+        r = call(m.longstaff_schwartz_american, **{**LS, "exercise_dates": 10}, backend="numpy", paths=2000,
+                 benchmark=False, boundary_points=0)
+        assert r["backend"] == "python" and "NumPy" in r["warnings"][0]
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Black-Litterman
+# ════════════════════════════════════════════════════════════════════════
+
+BL_ASSETS = ["US", "EU", "JP", "EM"]
+BL_VOLS = [0.16, 0.18, 0.20, 0.25]
+BL_CORR = [[1, .7, .5, .6], [.7, 1, .5, .6], [.5, .5, 1, .5], [.6, .6, .5, 1]]
+BL_W = [0.55, 0.25, 0.10, 0.10]
+BL = dict(assets=BL_ASSETS, volatilities=BL_VOLS, correlation=BL_CORR, market_weights=BL_W)
+
+
+def _inv(A):
+    n = len(A)
+    M_ = [list(map(float, row)) + [1.0 if i == j else 0.0 for j in range(n)] for i, row in enumerate(A)]
+    for c in range(n):
+        p = max(range(c, n), key=lambda r_: abs(M_[r_][c]))
+        M_[c], M_[p] = M_[p], M_[c]
+        d = M_[c][c]
+        M_[c] = [x / d for x in M_[c]]
+        for r_ in range(n):
+            if r_ != c:
+                f = M_[r_][c]
+                M_[r_] = [a - f * b for a, b in zip(M_[r_], M_[c])]
+    return [row[n:] for row in M_]
+
+
+def _mv(A, x):
+    return [sum(a * b for a, b in zip(row, x)) for row in A]
+
+
+def test_bl_matches_precision_form_posterior():
+    """Independent check: Theil mixed estimation [(tS)^-1 + P'O^-1P]^-1 [(tS)^-1 pi + P'O^-1 q]."""
+    views = [{"asset": "EM", "return": 0.10, "confidence": 0.6},
+             {"assets": {"US": 1, "EU": -1}, "return": 0.01, "omega": 0.0009}]
+    r = call(m.black_litterman_optimizer, **BL, views=views)
+    n, tau = 4, 0.05
+    Sig = [[BL_CORR[i][j] * BL_VOLS[i] * BL_VOLS[j] for j in range(n)] for i in range(n)]
+    pi = [2.5 * v for v in _mv(Sig, BL_W)]
+    P, q = [[0, 0, 0, 1], [1, -1, 0, 0]], [0.10, 0.01]
+    om = [0.4 / 0.6 * tau * Sig[3][3], 0.0009]
+    tSi = _inv([[tau * x for x in row] for row in Sig])
+    prec = [[tSi[i][j] + sum(P[k][i] * P[k][j] / om[k] for k in range(2)) for j in range(n)] for i in range(n)]
+    rhs = [a + sum(P[k][i] * q[k] / om[k] for k in range(2)) for i, a in enumerate(_mv(tSi, pi))]
+    mu = _mv(_inv(prec), rhs)
+    for a, x in zip(BL_ASSETS, mu):
+        approx(r["posterior_excess_returns"][a], x, 1e-12)
+    for a, x in zip(BL_ASSETS, pi):
+        approx(r["equilibrium_excess_returns"][a], x, 1e-14)
+    # posterior covariance of the mean = [(tS)^-1 + P'O^-1P]^-1  ->  Sigma_post = Sigma + that
+    Minv = _inv(prec)
+    for i, a in enumerate(BL_ASSETS):
+        approx(r["posterior_volatility"][a], math.sqrt(Sig[i][i] + Minv[i][i]), 1e-12)
+
+
+def test_bl_no_view_identities():
+    r = call(m.black_litterman_optimizer, **BL)
+    pf = r["portfolios"]
+    for a, w in zip(BL_ASSETS, BL_W):
+        approx(r["posterior_excess_returns"][a], r["equilibrium_excess_returns"][a], 1e-15)
+        approx(pf["unconstrained_prior_cov"]["weights"][a], w, 1e-12)            # reverse optimisation
+        approx(pf["unconstrained_posterior_cov"]["weights"][a], w / 1.05, 1e-12)  # He-Litterman: w/(1+tau)
+    prior = call(m.black_litterman_optimizer, **BL, use_posterior_covariance=False)["portfolios"]
+    for a, w in zip(BL_ASSETS, BL_W):  # with the prior covariance, w_mkt is already fully invested -> optimal
+        approx(prior["fully_invested"]["weights"][a], w, 1e-9)
+        approx(prior["long_only"]["weights"][a], w, 1e-9)
+
+
+def test_bl_confidence_monotone_and_certain_view():
+    fr = []
+    for c in (0.1, 0.3, 0.5, 0.7, 0.9, 1.0):
+        r = call(m.black_litterman_optimizer, **BL, views=[{"asset": "EM", "return": 0.10, "confidence": c}])
+        fr.append(r["views"][0]["fraction_of_gap_closed"])
+    assert all(a < b for a, b in zip(fr, fr[1:]))
+    approx(fr[-1], 1.0, 1e-12)                                     # c = 1: posterior satisfies the view exactly
+    approx(fr[2], 0.5, 1e-12)                                      # c = 0.5: omega = tau p S p' -> halfway
+
+
+def test_bl_tilt_lies_in_view_span():
+    views = [{"asset": "EM", "return": 0.10, "confidence": 0.6},
+             {"assets": {"US": 1, "EU": -1}, "return": 0.01, "confidence": 0.4}]
+    r = call(m.black_litterman_optimizer, **BL, views=views)
+    lam = [v["tilt_lambda"] for v in r["views"]]
+    P = [[0, 0, 0, 1], [1, -1, 0, 0]]
+    w = r["portfolios"]["unconstrained_prior_cov"]["weights"]
+    for i, a in enumerate(BL_ASSETS):
+        approx(w[a] - BL_W[i], sum(P[k][i] * lam[k] for k in range(2)), 1e-12)   # w* = w_mkt + P' Lambda
+
+
+def test_bl_long_only_qp_optimal():
+    views = [{"asset": "EM", "return": 0.15, "confidence": 0.9}, {"asset": "JP", "return": -0.05, "confidence": 0.8}]
+    for use_post in (True, False):
+        r = call(m.black_litterman_optimizer, **BL, views=views, max_weight=0.4, use_posterior_covariance=use_post)
+        lo = r["portfolios"]["long_only"]
+        w = [lo["weights"][a] for a in BL_ASSETS]
+        approx(sum(w), 1.0, 1e-12)
+        assert all(-1e-12 <= x <= 0.4 + 1e-12 for x in w) and lo["solver"]["kkt_max_violation"] < 1e-9
+    # With the prior covariance the objective is fully reconstructible here: brute-force dominance check.
+    n = 4
+    C = [[BL_CORR[i][j] * BL_VOLS[i] * BL_VOLS[j] for j in range(n)] for i in range(n)]
+    mu = [r["posterior_excess_returns"][a] for a in BL_ASSETS]
+    obj = lambda v: sum(a * b for a, b in zip(v, mu)) - 1.25 * sum(v[i] * v[j] * C[i][j]  # noqa: E731
+                                                                   for i in range(n) for j in range(n))
+    best = obj(w)
+    rng = random.Random(3)
+    for _ in range(3000):
+        v = m._proj_capped_simplex([rng.random() * 2 for _ in range(n)], 0.4)
+        assert obj(v) <= best + 1e-12
+
+
+def test_bl_market_excess_return_and_errors():
+    r = call(m.black_litterman_optimizer, **BL, market_excess_return=0.06)
+    approx(r["market"]["implied_excess_return"], 0.06, 1e-12)
+    call_err(m.black_litterman_optimizer, {**BL, "views": [{"asset": "XX", "return": 0.1}]})
+    call_err(m.black_litterman_optimizer, {**BL, "max_weight": 0.2})                     # 4 * 0.2 < 1
+    call_err(m.black_litterman_optimizer, {**BL, "correlation": [[1, 2, 0, 0], [2, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]})
+    call_err(m.black_litterman_optimizer, {"assets": ["A", "B"], "covariance": [[1, 2], [2, 1]], "market_weights": [.5, .5]})
+    dup = [{"asset": "EM", "return": 0.1, "confidence": 1}, {"asset": "EM", "return": 0.12, "confidence": 1}]
+    assert "linearly dependent" in call_err(m.black_litterman_optimizer, {**BL, "views": dup})
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Jane Street EV trainer
+# ════════════════════════════════════════════════════════════════════════
+
+TR_CATS = ("conditional_expectation", "dice_stopping", "card_stopping", "auction")
+
+
+def _gen(**kw):
+    return call(m.jane_street_ev_trainer, action="generate", **kw)
+
+
+def _solve(pid):
+    return call(m.jane_street_ev_trainer, action="solve", puzzle_id=pid)["solution"]
+
+
+def _find(cat, template, diff, pred=lambda pz: True, limit=400):
+    for seed in range(limit):
+        pz = m._tr_build(cat, template, diff, seed)
+        if pred(pz):
+            return pz
+    raise AssertionError(f"no {template} puzzle found")
+
+
+def _val(x):
+    return Fraction(x["exact"]) if isinstance(x, dict) and "exact" in x else (x["decimal"] if isinstance(x, dict) else x)
+
+
+def test_trainer_generate_deterministic_and_answer_hidden():
+    a = _gen(category="auction", difficulty=2, seed=11)
+    b = _gen(category="auction", difficulty=2, seed=11)
+    assert a == b and a["puzzle_id"].startswith("JSQR-AU-")
+    assert not {"ev", "solution", "verdict", "dist"} & set(a)
+    assert "[TAKE]" in a["answer_contract"] and "half-Kelly" in a["answer_contract"]
+    assert _gen(difficulty=1, seed=5)["category"] in TR_CATS
+
+
+def test_trainer_sweep_measures_and_verdict_rule():
+    seen = set()
+    for cat in TR_CATS:
+        for d in (1, 2, 3):
+            for seed in range(25):
+                g = _gen(category=cat, difficulty=d, seed=seed)
+                pz = m._tr_build(*m._tr_parse_id(g["puzzle_id"]))
+                assert sum(pz["dist"].values()) == 1 and all(p > 0 for p in pz["dist"].values())
+                sol = m._tr_solution(pz)
+                seen.add((cat, sol["verdict"]))
+                if sol["ev"] <= 0:
+                    assert sol["verdict"] == "PASS"
+                elif sol["verdict"] == "HEDGE":
+                    h = pz["hedge"]
+                    assert h["var_after"] < h["cap"] < h["var_before"]
+                    approx(float(h["var_after"]), float(h["var_before"] - h["ratio"] ** 2 * h["var_hedge"]), 1e-12)
+                elif sol["size"] is not None:                         # TAKE: Kelly first-order condition
+                    net = {x - pz["price"]: p for x, p in pz["dist"].items()}
+                    n_star, B = 2 * sol["size"], float(pz["bankroll"])
+                    foc = sum(float(p) * float(x) / (B + n_star * float(x)) for x, p in net.items())
+                    assert abs(foc) < 1e-9 * max(1.0, sum(abs(float(x)) for x in net) / B)
+    assert {v for _, v in seen} == {"TAKE", "PASS", "HEDGE"}
+
+
+def test_trainer_reroll_matches_ev_calculator():
+    for seed in range(15):
+        pz = m._tr_build("dice_stopping", "reroll", 2, seed)
+        n = int(re.search(r"fair (\d+)-sided", pz["prompt"]).group(1))
+        k = int(re.search(r"up to (\d+) rolls", pz["prompt"]).group(1))
+        c = re.search(r"re-roll costs \$(\d+(?:\.\d+)?)", pz["prompt"])
+        c = Fraction(c.group(1)) if c else Fraction(0)
+        ref = call(m.ev_calculator, puzzle="dice_reroll", faces=n, rolls=k, cost_per_roll=str(c))
+        fair, _ = m._moments(pz["dist"])
+        assert fair == Fraction(ref["expected_value"]["exact"]) + c    # trainer's first roll is free
+
+
+def test_trainer_red_black_matches_ev_calculator():
+    pz = _find("card_stopping", "red_black", 1)  # difficulty 1 uses +1 red / -1 black
+    R, B = map(int, re.search(r"deck of (\d+) red and (\d+) black", pz["prompt"]).groups())
+    ref = call(m.ev_calculator, puzzle="card_red_black", red=R, black=B)
+    assert m._moments(pz["dist"])[0] == Fraction(ref["expected_value"]["exact"])
+
+
+def test_trainer_pig_hold_at_20():
+    pz = _find("dice_stopping", "pig", 2, lambda p: "6-sided" in p["prompt"])
+    fair = m._moments(pz["dist"])[0]
+    assert fair == Fraction(492303203, 60466176)                  # 8.14179..., the classic hold-at-20 value
+    rng = random.Random(1)
+    tot, n = 0, 60000
+    for _ in range(n):
+        s = 0
+        while s < 20:
+            f = rng.randint(1, 6)
+            if f == 1:
+                s = 0
+                break
+            s += f
+        tot += s
+    assert abs(tot / n - float(fair)) < 0.12
+
+
+def test_trainer_cards_bruteforce():
+    names = {"an ace": lambda c: c[0] == 1, "a heart": lambda c: c[1] == 0, "a red card": lambda c: c[1] in (0, 1),
+             "a face card (J, Q, K)": lambda c: c[0] >= 11}
+    deck = [(r_, s_) for r_ in range(1, 14) for s_ in range(4)]
+    checked = 0
+    for seed in range(12):
+        pz = m._tr_build("conditional_expectation", "cards", 2, seed)
+        mt = re.search(r"(\d) cards are dealt.*at least one of them is (.+?)\. You may pay .+? to receive \$(\d+) "
+                       r"for every card among the \d that is (.+?)\.$", pz["prompt"])
+        d, a1, mult, a2 = int(mt.group(1)), mt.group(2), int(mt.group(3)), mt.group(4)
+        num = den = 0
+        for hand in itertools.combinations(deck, d):
+            if any(names[a1](c) for c in hand):
+                den += 1
+                num += mult * sum(names[a2](c) for c in hand)
+        assert m._moments(pz["dist"])[0] == Fraction(num, den)
+        checked += 1
+    assert checked == 12
+
+
+def test_trainer_auctions_bruteforce():
+    for seed in range(10):
+        pz = m._tr_build("auction", "acquire", 2, seed)
+        N = int(re.search(r"integers 0\.\.(\d+)", pz["prompt"]).group(1))
+        k = Fraction(re.search(r"worth (\d+(?:/\d+)?)\*V", pz["prompt"]).group(1))
+        b0 = int(re.search(r"offer b = \$(\d+)", pz["prompt"]).group(1))
+        ev = sum((k * v - b0) for v in range(N + 1) if v <= b0) / Fraction(N + 1)
+        assert m._tr_solution(pz)["ev"] == ev
+        assert pz["extra"]["optimal_bid"] == (0 if k < 2 else N)
+    for seed in range(10):
+        pz = m._tr_build("auction", "first_price", 2, seed)
+        v = int(re.search(r"value an item at \$(\d+)", pz["prompt"]).group(1))
+        H = int(re.search(r"uniform on 0\.\.(\d+)", pz["prompt"]).group(1))
+        b0 = int(re.search(r"bid \$(\d+)\?", pz["prompt"]).group(1))
+        win = sum(Fraction(1) if b0 > x else (Fraction(1, 2) if b0 == x else 0) for x in range(H + 1)) / (H + 1)
+        assert m._tr_solution(pz)["ev"] == (v - b0) * win - pz["price"]
+        evs = {b: (v - b) * sum(Fraction(1) if b > x else (Fraction(1, 2) if b == x else 0)
+                                for x in range(H + 1)) / (H + 1) for b in range(0, min(v, H + 1) + 1)}
+        assert evs[pz["extra"]["optimal_bid"]] == max(evs.values())
+
+
+def test_trainer_next_red_martingale():
+    pz = _find("card_stopping", "next_red", 1)
+    R, B = map(int, re.search(r"deck of (\d+) red and (\d+) black", pz["prompt"]).groups())
+    rng = random.Random(8)
+    wins, n = 0, 20000
+    for _ in range(n):  # a 'greedy' strategy: call when reds are over-represented, else at the last card
+        deck = [1] * R + [0] * B
+        rng.shuffle(deck)
+        r_, b_ = R, B
+        for i, c in enumerate(deck):
+            if r_ > b_ or i == len(deck) - 1:
+                wins += c
+                break
+            r_, b_ = r_ - c, b_ - (1 - c)
+    assert abs(wins / n - R / (R + B)) < 4 * math.sqrt(0.25 / n)
+
+
+def test_trainer_check_scoring_and_strictness():
+    g = _gen(category="dice_stopping", difficulty=1, seed=3)
+    sol = _solve(g["puzzle_id"])
+    ev_exact = sol["ev"]["exact"] if isinstance(sol["ev"], dict) else str(sol["ev"])
+    size = _val(sol["size"]) if sol["size"] is not None else None
+    proof = "State space: ... Transition probabilities: ... Terminal payoffs: ... EV = x. " + sol["verdict_line"]
+    perfect = call(m.jane_street_ev_trainer, action="check", puzzle_id=g["puzzle_id"], verdict=sol["verdict_line"],
+                   ev=ev_exact, size=float(size) if size else None, proof=proof)
+    assert perfect["score"] == 100 and perfect["grade"] == "desk-ready"
+    wrong_tag = "[PASS]" if sol["verdict"] != "PASS" else "[TAKE] 5"
+    bad = call(m.jane_street_ev_trainer, action="check", puzzle_id=g["puzzle_id"], verdict=wrong_tag, ev=ev_exact)
+    assert bad["breakdown"]["verdict"]["points"] == 0 and bad["score"] <= 60
+    dec = call(m.jane_street_ev_trainer, action="check", puzzle_id=g["puzzle_id"], verdict=sol["verdict_line"],
+               ev=round(float(Fraction(ev_exact)), 6))
+    assert dec["breakdown"]["ev"]["points"] in (27, 30)
+    for v in ("TAKE", "[TAKE] [PASS]", "[take]"):
+        call_err(m.jane_street_ev_trainer, {"action": "check", "puzzle_id": g["puzzle_id"], "verdict": v, "ev": 1})
+    call_err(m.jane_street_ev_trainer, {"action": "check", "puzzle_id": "JSQR-XX-dice-1-1", "verdict": "[PASS]", "ev": 0})
+    call_err(m.jane_street_ev_trainer, {"action": "solve", "puzzle_id": "JSQR-DS-pig-1-1"})   # pig needs diff >= 2
+
+
+def test_trainer_hedge_and_full_kelly_scoring():
+    pz = None
+    for seed in range(300):
+        for d in (2, 3):
+            cand = m._tr_build("conditional_expectation", "dice", d, seed)
+            if m._tr_solution(cand)["verdict"] == "HEDGE":
+                pz = cand
+                break
+        if pz:
+            break
+    assert pz is not None
+    sol = m._tr_solution(pz)
+    ok = call(m.jane_street_ev_trainer, action="check", puzzle_id=pz["puzzle_id"], verdict=sol["verdict_line"],
+              ev=str(sol["ev"]), size=float(sol["size"]))
+    assert ok["breakdown"]["size"]["points"] == 20 and ok["breakdown"]["verdict"]["points"] == 40
+    take = None
+    for seed in range(300):
+        cand = m._tr_build("auction", "acquire", 2, seed)
+        s = m._tr_solution(cand)
+        if s["verdict"] == "TAKE" and s["size"]:
+            take = (cand, s)
+            break
+    cand, s = take
+    full = call(m.jane_street_ev_trainer, action="check", puzzle_id=cand["puzzle_id"], verdict="[TAKE]",
+                ev=str(s["ev"]), size=2 * s["size"])
+    assert full["breakdown"]["size"]["points"] == 10                   # full Kelly: half credit
+
+
+# ════════════════════════════════════════════════════════════════════════
 # Robustness: zero-crash fuzzing of every tool
 # ════════════════════════════════════════════════════════════════════════
 
@@ -771,16 +1284,19 @@ def test_handlers_accept_extra_kwargs():
 
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
-    failed = 0
+    failed = skipped = 0
     t0 = time.time()
     for name, fn in tests:
         t = time.time()
         try:
             fn()
             print(f"PASS  {name}  ({time.time() - t:.2f}s)")
+        except Skip as e:
+            skipped += 1
+            print(f"SKIP  {name}  ({e})")
         except Exception:
             failed += 1
             print(f"FAIL  {name}")
             traceback.print_exc()
-    print(f"\n{len(tests) - failed} passed, {failed} failed in {time.time() - t0:.1f}s")
+    print(f"\n{len(tests) - failed - skipped} passed, {failed} failed, {skipped} skipped in {time.time() - t0:.1f}s")
     sys.exit(1 if failed else 0)

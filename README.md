@@ -2,7 +2,7 @@
 
 **A math-first quantitative research and trading-interview assistant, packaged as a [Hermes Agent](https://github.com/NousResearch/hermes-agent) v0.22.7 plugin.**
 
-Ten deterministic, validated pricing / probability / microstructure engines exposed as LLM tools, plus a system-prompt persona and two lifecycle hooks that force every answer into a desk-grade decision format: *state space → transitions → payoffs → EV → `[TAKE]` / `[PASS]` / `[HEDGE]`*.
+Fourteen deterministic, validated pricing / execution / portfolio / probability / microstructure engines exposed as LLM tools, plus a system-prompt persona and two lifecycle hooks that force every answer into a desk-grade decision format: *state space → transitions → payoffs → EV → `[TAKE]` / `[PASS]` / `[HEDGE]`*.
 
 Built for the Hermes Plugin Hackathon to the standard you'd expect from a Waterloo Math/CS, IMO / ICPC / Putnam background: derive it, compute it, verify it two ways, and size it.
 
@@ -10,10 +10,10 @@ Built for the Hermes Plugin Hackathon to the standard you'd expect from a Waterl
 |---|---|
 | Plugin id | `waterloo-jane-street-qr` · v1.0.0 |
 | Host | Hermes Agent v0.22.7 (plugin manifest v2) |
-| Runtime deps | **None.** Python standard library only (`math`, `cmath`, `fractions`, `random`, `json`, `re`) |
+| Runtime deps | **None required.** Python standard library only. **Optional:** NumPy vectorises `longstaff_schwartz_american` (5× path budget, ~10× faster); SciPy is not used. |
 | Python | 3.11 (Hermes venv) and 3.14 tested |
-| Tools | 10 · Hooks: `pre_llm_call`, `transform_llm_output` · 1 system-prompt section |
-| Tests | 53 (known-answer, cross-model, simulation, property and fuzz tests), ~8–10 s |
+| Tools | 14 · Hooks: `pre_llm_call`, `transform_llm_output` · 1 system-prompt section |
+| Tests | 81 (known-answer, cross-model, simulation, brute-force, property and fuzz tests), ~15–20 s |
 | License | MIT |
 
 ---
@@ -34,6 +34,10 @@ Built for the Hermes Plugin Hackathon to the standard you'd expect from a Waterl
    - [4.8 `matrix_game_solver`](#48-matrix_game_solver)
    - [4.9 `ev_calculator`](#49-ev_calculator)
    - [4.10 `order_book_metrics`](#410-order_book_metrics)
+   - [4.11 `almgren_chriss_liquidation`](#411-almgren_chriss_liquidation)
+   - [4.12 `longstaff_schwartz_american`](#412-longstaff_schwartz_american)
+   - [4.13 `black_litterman_optimizer`](#413-black_litterman_optimizer)
+   - [4.14 `jane_street_ev_trainer`](#414-jane_street_ev_trainer)
 5. [System prompt & persona engineering](#5-system-prompt--persona-engineering)
 6. [Programmatic usage & API contract](#6-programmatic-usage--api-contract)
 7. [Test suite](#7-test-suite)
@@ -100,7 +104,7 @@ It is a research and teaching tool, **not** an execution system (see [§9](#9-li
 | **Safety wrapper** (`_safe`) | Turns a `dict -> dict` function into a Hermes handler `(args, **kwargs) -> str` that **never raises**. |
 | **Serialisation** (`_clean`, `_frac_out`) | Strict JSON. NaN/∞ become `null`. A `Fraction` becomes `{"decimal": float, "exact": "p/q"}`; `exact` is omitted when it would exceed 40 digits. |
 | **Persona & enforcement** (`PERSONA_PROMPT`, `DESK_REMINDER`, `audit_response`, `_make_hooks`) | Prompt engineering and the per-turn and output hooks. |
-| **Registration** (`register(ctx)`) | Registers 10 tools under toolset `waterloo_qr`, the prompt section and both hooks, with a fallback for older hosts. |
+| **Registration** (`register(ctx)`) | Registers 14 tools under toolset `waterloo_qr`, the prompt section and both hooks, with a fallback for older hosts. |
 
 ### Design rules
 
@@ -128,7 +132,7 @@ hermes plugins doctor --ci waterloo-jane-street-qr
 hermes plugins validate waterloo-jane-street-qr
 ```
 
-Expected output: `registrations: 10 tool(s), 2 hook(s)` and `security scan — safe`.
+Expected output: `registrations: 14 tool(s), 2 hook(s)` and `security scan — safe`.
 
 Tools and the system-prompt section take effect from the **next new session**.
 
@@ -170,6 +174,10 @@ Conventions used by every tool:
 | `matrix_game_solver` | Game theory | Exact rational simplex, LP duality | Bland's rule, ≤ 25×25 |
 | `ev_calculator` | Probability puzzles | Exact Markov chains, DP over ℚ | Puzzle-dependent |
 | `order_book_metrics` | Microstructure | Top-of-book / depth analytics | $O(L \log L)$ |
+| `almgren_chriss_liquidation` | Optimal execution | Closed-form discrete AC trajectory + frontier | $O(N)$ |
+| `longstaff_schwartz_american` | American / Bermudan | LSM, Laguerre regression, in/out-of-sample | $O(M N d^2)$, NumPy-vectorised |
+| `black_litterman_optimizer` | Portfolio construction | Bayesian posterior + FISTA/active-set QP | $O(n^3 + k^2 n)$ |
+| `jane_street_ev_trainer` | Interview drills | Exact DP / enumeration, Kelly, min-var hedge | Puzzle-dependent |
 
 ---
 
@@ -612,6 +620,238 @@ Snapshot analytics on L2 ladders. Input order does not matter, duplicate price l
 
 ---
 
+### 4.11 `almgren_chriss_liquidation`
+
+Optimal execution of a large block over $N$ discrete intervals (Almgren & Chriss, 2000). The trader minimises expected implementation shortfall plus $\lambda\cdot$variance.
+
+**Model**
+
+- The price follows an arithmetic random walk with linear **permanent** impact $g(v)=\gamma v$ (Kyle's λ; `kyle_lambda` is an alias).
+- Linear **temporary** impact is $h(v)=\varepsilon\,\mathrm{sgn}(v)+\eta v$, where $v = n_k/\tau$ is the trading rate.
+
+```math
+S_k=S_{k-1}+\sigma\sqrt\tau\,\xi_k-\gamma n_k,\qquad \tilde S_k=S_{k-1}-\varepsilon-\eta\,\frac{n_k}{\tau},\qquad \tau=T/N
+```
+
+```math
+\mathbb E[\text{IS}]=\tfrac12\gamma X^2+\varepsilon\sum_k|n_k|+\frac{\tilde\eta}{\tau}\sum_k n_k^2,\qquad
+\mathrm{Var}[\text{IS}]=\sigma^2\tau\sum_{k=1}^{N}x_k^2,\qquad \tilde\eta=\eta-\tfrac12\gamma\tau
+```
+
+**Solution.** Minimising $U=\mathbb E+\lambda\mathrm{Var}$ over the holdings $x_1,\dots,x_{N-1}$ gives the discrete Euler–Lagrange equation $(x_{k-1}-2x_k+x_{k+1})/\tau^2=\tilde\kappa^2x_k$, where $\tilde\kappa^2=\lambda\sigma^2/\tilde\eta$. Its solution is
+
+```math
+x_k=X\,\frac{\sinh\big(\kappa(T-t_k)\big)}{\sinh(\kappa T)},\qquad \cosh(\kappa\tau)=1+\tfrac12\tilde\kappa^2\tau^2 .
+```
+
+**Numerics**
+
+- $\kappa$ uses the cancellation-free $\operatorname{acosh}(1+x)=\log1p\!\big(x+\sqrt{x(x+2)}\big)$.
+- The sinh ratio is evaluated as $e^{-\kappa t}\,\mathrm{expm1}(-2\kappa(T-t))/\mathrm{expm1}(-2\kappa T)$, so it cannot overflow for urgent trades.
+- $\lambda=0$ reduces exactly to TWAP.
+- Inputs with $\tilde\eta\le0$ are rejected: the problem is ill-posed there and the "optimal" schedule would be arbitrage.
+
+**Outputs**
+
+- the schedule (holdings, trades, rates, % executed), expected cost, std and utility, also in bps of arrival notional if `spot` is given;
+- the cost split into permanent, fixed and temporary;
+- **TWAP** and **immediate-execution** benchmarks;
+- a 14-point **efficient frontier**;
+- an **optimality certificate**: Euler–Lagrange residual, plus a check that the optimum beats TWAP and immediate execution.
+
+Example from Almgren & Chriss (2000): X = 10⁶ shares, S₀ = $50, 30% annual vol (σ = 0.95 \$/√day), T = 5 days, N = 5, ε = 0.0625, η = 2.5·10⁻⁶, γ = 2.5·10⁻⁷, λ = 10⁻⁶.
+
+| Output | Value |
+|---|---|
+| κ | **0.6063 / day** (paper: ≈ 0.6) |
+| Holdings $x_0..x_5$ | 1,000,000 · 542,381 · 290,295 · 148,216 · 62,303 · 0 |
+| E[IS] ± sd (optimal) | $910,478 ± $603,215 |
+| E[IS] ± sd (TWAP) | $662,500 ± $1,039,230 |
+| Euler–Lagrange residual | 1.4·10⁻¹⁶ |
+
+| Parameter | Type | Default | Notes |
+|---|---|---|---|
+| `shares` | number | required | X; > 0 sell, < 0 buy |
+| `horizon` | number | required | T in time units (e.g. days) |
+| `periods` | int | 10 | N ∈ [1, 10 000] |
+| `volatility` | number | required | **absolute** σ (\$/share/√time) |
+| `permanent_impact` / `kyle_lambda` | number | 0 | γ ($/share per share) |
+| `temporary_impact` | number | required | η > γτ/2 |
+| `fixed_cost` | number | 0 | ε (half-spread + fees) |
+| `risk_aversion` | number | required | λ ≥ 0 (1/$) |
+| `spot` | number | none | Enables bps reporting |
+| `max_schedule_rows` | int | 60 | Schedule rows returned |
+
+---
+
+### 4.12 `longstaff_schwartz_american`
+
+Least-squares Monte Carlo (Longstaff & Schwartz, 2001) for American and Bermudan options on GBM.
+
+**Algorithm**
+
+1. Simulate GBM paths with antithetic pairing.
+2. Set the cash flow at maturity to the payoff.
+3. Step backwards. At each exercise date $t_i$, regress the discounted realised cash flows of **in-the-money** paths on basis functions of $x = S/K$:
+
+```math
+\hat C(t_i,x)=\sum_{j=0}^{d}\beta_j\,\psi_j(x),\qquad \psi_0=1,\ \ \psi_{j+1}(x)=e^{-x/2}L_j(x)\ \text{(weighted Laguerre)}
+```
+
+   The Laguerre polynomials come from the recurrence $L_{n+1}=\big((2n+1-x)L_n-nL_{n-1}\big)/(n+1)$. `basis` can also be `laguerre_unweighted` or `monomial`, with `degree` 1–6.
+
+4. Exercise where intrinsic value > $\hat C$, and replace that path's cash flow.
+
+**Two estimators** (both are reported, so the user can see the bias bracket):
+
+| Estimator | Construction | Bias |
+|---|---|---|
+| In-sample | Regression and valuation on the same paths | High (the regression sees the future) |
+| **Out-of-sample** (default) | Fitted policy $\{\beta_{t_i}\}$ applied to an **independent** path set | **Low**: a feasible stopping rule cannot beat the optimal one |
+
+**Variance reduction and error bars**
+
+- A European control variate (Black–Scholes mean) is applied to both estimators.
+- Its measured gain is modest for American puts (≈1.1× ITM, 1.3× ATM, 2.2× OTM) because early exercise decorrelates the payoffs. It is reported, not assumed.
+- `std_error` is **conditional on the fitted policy**. Across seeds, regression noise adds roughly as much again (measured: per-run SE 0.0058 vs seed-to-seed sd 0.0081). The output states this explicitly.
+
+**Benchmarks**
+
+- An apples-to-apples **Bermudan CRR**: a lattice with exercise allowed only every `⌈400/N⌉` steps, via `exercise_every` on the shared `_crr_tree` kernel.
+- The continuous-exercise American CRR.
+- A z-score against the Bermudan reference.
+
+The exercise boundary comes from scanning, starting at the strike, for the first crossing of intrinsic over $\hat C$, where the regression is best populated.
+
+**Backends.** With NumPy installed (`backend="auto"`), paths are generated as one $(N{+}1)\times M$ matrix (cumulative sum and `exp` in place) and the regressions use `numpy.linalg.lstsq`. The budget is 5·10⁶ path-dates. Without NumPy, a pure-Python implementation (column-wise `array('d')` storage, column-scaled normal equations solved by Cholesky with a ridge fallback) gives identical semantics, with a budget of 10⁶ path-dates.
+
+Validation (Longstaff–Schwartz Table 1: S = 36, K = 40, r = 6%, σ = 20%, T = 1, 50 dates; the paper reports LSM 4.472):
+
+| | Value |
+|---|---|
+| Bermudan CRR (400 / 1000 / 2000 steps) | 4.4792 / 4.4784 / **4.4780** |
+| Python backend, 20k paths | 4.4940 ± 0.0131 (z = +1.1), in-sample 4.4713, 1.6 s |
+| NumPy backend, 100k paths | 4.4859 ± 0.0058 (z = +1.1), 0.7 s |
+| **12 seeds × 100k (out-of-sample mean)** | **4.4748 ± 0.0024**, low-biased by 0.003 as theory predicts |
+| Boundary $S^*(t)$ at t ≈ 0.34 / 0.56 / 0.76 / 0.98 | LSM 33.95 / 34.53 / 35.21 / 37.16 vs CRR 33.37 / 34.22 / 35.10 / 37.87 |
+
+| Parameter | Type | Default | Notes |
+|---|---|---|---|
+| `spot`, `strike`, `time_to_maturity`, `risk_free_rate`, `volatility`, `dividend_yield` | number | required (q = 0) | As in `black_scholes` |
+| `option_type` | `call`/`put` | `put` | |
+| `exercise_dates` | int | 50 | [1, 500] |
+| `paths` | int | 50 000 (NumPy) / 20 000 (Python) | Includes antithetic paths |
+| `basis` | `laguerre`/`laguerre_unweighted`/`monomial` | `laguerre` | |
+| `degree` | int | 3 | [1, 6] |
+| `seed` | int | 42 | Out-of-sample paths use an independent stream |
+| `antithetic`, `out_of_sample`, `control_variate`, `benchmark` | bool | true | |
+| `boundary_points` | int | 10 | |
+| `backend` | `auto`/`numpy`/`python` | `auto` | `numpy` without NumPy falls back with a warning |
+
+---
+
+### 4.13 `black_litterman_optimizer`
+
+Black & Litterman (1992), in the He & Litterman (1999) formulation.
+
+**Prior.** Reverse optimisation of market weights gives equilibrium excess returns $\pi=\delta\Sigma w_{\text{mkt}}$. The prior is $\mu\sim\mathcal N(\pi,\tau\Sigma)$. Use $\delta$ = `risk_aversion` (default 2.5), or derive it from `market_excess_return` / $w^\top\Sigma w$.
+
+**Views.** $P\mu=q+\epsilon$ with $\epsilon\sim\mathcal N(0,\Omega)$. Views can be absolute (`{"asset": "EM", "return": 0.10}`) or relative (`{"assets": {"US": 1, "EU": -1}, ...}`). Confidence $c\in(0,1]$ maps to $\omega_k=\frac{1-c}{c}\,\tau\,p_k\Sigma p_k^\top$, so $c = 1$ is an exact view and $c = \tfrac12$ is He–Litterman's $\omega=\tau p\Sigma p^\top$. An explicit `omega` overrides the confidence.
+
+**Posterior.** Computed in the form that stays valid as $\Omega\to0$ (no $\Omega^{-1}$), using Cholesky solves throughout:
+
+```math
+\mu_{BL}=\pi+\tau\Sigma P^\top\big(P\tau\Sigma P^\top+\Omega\big)^{-1}(q-P\pi),\qquad
+\Sigma_{\text{post}}=\Sigma+\tau\Sigma-\tau\Sigma P^\top\big(P\tau\Sigma P^\top+\Omega\big)^{-1}P\tau\Sigma
+```
+
+**Portfolios returned**
+
+| Portfolio | Definition |
+|---|---|
+| Unconstrained (prior cov) | $(\delta\Sigma)^{-1}\mu_{BL}=w_{\text{mkt}}+P^\top\Lambda$. Tilts lie only along the view portfolios; $\Lambda$ is reported per view. |
+| Unconstrained (posterior cov) | $(\delta\Sigma_{\text{post}})^{-1}\mu_{BL}$; with no views this equals $w_{\text{mkt}}/(1+\tau)$ |
+| Fully invested | Closed form with a budget multiplier; shorts allowed |
+| **Long-only** with `max_weight` | FISTA projected gradient onto the capped simplex (exact bisection projection), then an **exact active-set KKT solve** on the identified free set. KKT violation is reported (~10⁻¹⁷ in tests). |
+
+Per-view diagnostics: equilibrium-implied value $p\pi$, posterior value $p\mu$, and the **fraction of the gap closed**. That fraction is exactly 0.5 at $c = \tfrac12$ and exactly 1 at $c = 1$ (tested).
+
+Example (4 regions, 2 views, `max_weight` 0.5): the EM view at 10% with c = 0.6 moves EM from π = 7.18% to μ = 8.84% (58.8% of the gap). The long-only solution is US 0.50 / EU 0.168 / JP 0.096 / EM 0.237 after 233 iterations, with KKT violation 9·10⁻¹⁸. The posterior matches the independent precision form $[(\tau\Sigma)^{-1}+P^\top\Omega^{-1}P]^{-1}[(\tau\Sigma)^{-1}\pi+P^\top\Omega^{-1}q]$ to **1.4·10⁻¹⁷**.
+
+| Parameter | Type | Default | Notes |
+|---|---|---|---|
+| `assets` | string[] | required | 1–60 distinct names |
+| `covariance` **or** `volatilities` + `correlation` | matrix / arrays | required | Annualised; must be symmetric positive definite |
+| `market_weights` | number[] | required | Normalised (with a warning) if they don't sum to 1 |
+| `risk_aversion` / `market_excess_return` | number | 2.5 / none | Mutually exclusive |
+| `tau` | number | 0.05 | |
+| `views` | object[] | [] | `asset` or `assets`, plus `return`, `confidence` or `omega`, and optional `label` |
+| `risk_free_rate` | number | 0 | For reporting total returns |
+| `max_weight` | number | 1 | Long-only cap; must satisfy max_weight × n ≥ 1 |
+| `use_posterior_covariance` | bool | true | Covariance used by the constrained optimisers |
+
+---
+
+### 4.14 `jane_street_ev_trainer`
+
+An interactive, **stateless** interview simulator. A puzzle id such as `JSQR-AU-first_price-3-2026` deterministically regenerates the puzzle from (category, template, difficulty, seed). Generation uses a SHA-512-seeded `random.Random`, so it does not depend on `PYTHONHASHSEED` and needs no server-side storage.
+
+| `action` | Behaviour |
+|---|---|
+| `generate` | Returns the prompt (priced as a trade, with a bankroll), the puzzle id and the answer contract. **No solution.** |
+| `check` | Grades `verdict` (**must** contain exactly one `[TAKE]`/`[PASS]`/`[HEDGE]` tag), `ev`, `size` and the `proof` text, out of 100, then reveals the full solution. |
+| `solve` | Reveals the exact solution: the 5-part proof, verdict line, risk numbers and hedge details. |
+
+**Puzzle families** (all solved in exact rational arithmetic, including the full payoff distribution under the optimal policy):
+
+| Category | Templates | Solution method |
+|---|---|---|
+| `conditional_expectation` | 2–3 dice (d6/d8), n coin flips, 2–3 cards from a 52-card deck, each under random conditioning events | Enumeration over the conditional space; multivariate hypergeometric for cards |
+| `dice_stopping` | Re-roll game (k rolls, re-roll fee, payoff f or f²); Pig ("roll a 1, lose it all") | Backward induction; one-step lookahead proved optimal by closedness of the stopping set |
+| `card_stopping` | Red/black deck with asymmetric payoffs; "call the next red card" | DP over (r, b); martingale / optional stopping (no strategy beats R/(R+B)) |
+| `auction` | Acquiring-a-company (winner's curse, value multiplier k); first-price sealed bid vs a uniform rival with entry fee | Closed-form EV(b) and an integer argmax for the optimal bid |
+
+**Verdict rule** (the same contract the persona enforces):
+
+| Condition | Verdict | Size |
+|---|---|---|
+| EV ≤ 0 | `[PASS]` | 0 |
+| EV > 0 and the stated variance limit is breached | `[HEDGE]` | Minimum-variance ratio β = Cov(Y,H)/Var(H) in the offered fair-priced hedge instrument |
+| Otherwise | `[TAKE]` | **Half-Kelly** contracts: n* solves $\sum_i p_i x_i/(B+n x_i)=0$ on the stated bankroll |
+
+**Scoring**
+
+| Component | Points | Rule |
+|---|---|---|
+| Verdict | 40 | Correct tag |
+| EV | 30 | Exact fraction 30 · correct to rounding 27 · within 1% 15 |
+| Size | 20 | Half-Kelly within 10% (full Kelly gets 10) · hedge ratio within 1% |
+| Proof structure | 10 | State space, transitions, payoffs, an EV equation and a verdict tag |
+
+Independent checks in the test suite:
+
+- re-roll values equal `ev_calculator` exactly;
+- red/black values equal `ev_calculator` exactly;
+- Pig d6 gives V(0) = 492303203/60466176 ≈ 8.14179, the classic hold-at-20 value, confirmed by simulation;
+- card puzzles are brute-forced over every C(52, d) hand;
+- auctions are brute-forced over every rival bid;
+- "next red" is checked by simulating a non-trivial stopping strategy;
+- every TAKE size satisfies the Kelly first-order condition.
+
+| Parameter | Used by | Notes |
+|---|---|---|
+| `action` | all | `generate` (default) / `check` / `solve` |
+| `category` | generate | `random` (default), `conditional_expectation`, `dice_stopping`, `card_stopping`, `auction` |
+| `template` | generate | Optional: `dice`, `coins`, `cards`, `reroll`, `pig`, `red_black`, `next_red`, `acquire`, `first_price` (gated by difficulty) |
+| `difficulty` | generate | 1–3 (default 2) |
+| `seed` | generate | Reproducible puzzle (default random; echoed in `puzzle_id`) |
+| `puzzle_id` | check, solve | Id returned by `generate` |
+| `verdict`, `ev`, `size`, `proof` | check | Tag string, EV per contract (an exact fraction scores highest), contracts or hedge ratio, derivation text |
+
+Live example: in a Hermes session the agent generated `JSQR-AU-first_price-3-2026` ($100 value, rival uniform on 0..50, $45 fee, bid $31). It derived EV = (21/34)·69 − 45 = −81/34, answered `[PASS]`, and the grader returned **100/100**.
+
+---
+
 ## 5. System prompt & persona engineering
 
 Prompting a model to "be rigorous" does not reliably work. The plugin instead enforces a *format*, because a format can be checked. It works on three layers, from always-on context to post-hoc audit.
@@ -775,16 +1015,19 @@ The model calls `monte_carlo_engine`, answers in the five-part contract and ends
 
 ## 7. Test suite
 
-`waterloo-jane-street-qr/tests/test_plugin.py` has **53 tests**. It is self-contained: it loads the plugin by path and needs no Hermes runtime. It runs under pytest or as a plain script.
+`waterloo-jane-street-qr/tests/test_plugin.py` has **81 tests**. It is self-contained: it loads the plugin by path and needs no Hermes runtime. It runs under pytest or as a plain script.
 
 ```bash
 cd waterloo-jane-street-qr
 
 # pytest (installed in the Hermes venv)
-~/.hermes/hermes-agent/venv/bin/python -m pytest -q tests/        # 53 passed in ~8–10 s
+~/.hermes/hermes-agent/venv/bin/python -m pytest -q tests/        # 79 passed, 2 skipped (no NumPy in the Hermes venv)
 
 # standalone, no third-party deps
-python3 tests/test_plugin.py                                       # 53 passed, 0 failed
+python3 tests/test_plugin.py                                       # 79 passed, 2 skipped
+
+# with NumPy available, the NumPy-backend tests run too
+/path/to/venv-with-numpy/bin/python tests/test_plugin.py          # 81 passed, 0 skipped
 
 # host-contract checks
 hermes plugins doctor --ci .
@@ -793,7 +1036,7 @@ hermes plugins validate .
 
 | Category | What is asserted |
 |---|---|
-| **Registration & manifest** | All 10 tools registered with valid JSON Schemas (`required` ⊆ `properties`, every property typed and described). `plugin.yaml` `provides_tools` / `provides_hooks` match the registrations exactly. Legacy-host fallback works. |
+| **Registration & manifest** | All 14 tools registered with valid JSON Schemas (`required` ⊆ `properties`, every property typed and described). `plugin.yaml` `provides_tools` / `provides_hooks` match the registrations exactly. Legacy-host fallback works. |
 | **Persona & enforcement** | Prompt ≤ 4000 chars, contains every contract element and names every tool. All four enforcement modes (including an invalid value → strict) behave per [§5.3](#53-enforcement-modes). `audit_response` accepts and rejects the right patterns. |
 | **Black–Scholes** | Hull reference values. Every Greek, including ρ with dividends, matches central finite differences. IV round-trip to 10⁻⁶. Arbitrage-violating quotes are rejected. |
 | **Binomial** | Hull's 5-step example (4.4885). 1000-step convergence to the literature value. American call with q = 0 has zero premium and no boundary, and gains a premium with q = 10%. Boundary is monotone and ≤ K. Deep-ITM put exercises immediately. Greeks are consistent with BS. Rejects $p\notin(0,1)$. |
@@ -803,6 +1046,10 @@ hermes plugins validate .
 | **VPIN** | All-buys gives VPIN = 1; alternating gives 0. Volume conservation across split buckets. BVC and tick-rule direction. **Recovers a planted Kyle λ** (0.002 ± 4·10⁻⁴, R² > 0.8). |
 | **Optimal stopping** | Secretary exact (n = 10) and the 1/e asymptote (n = 10⁵). Uniform recursion 1/2, 5/8, 89/128 with thresholds and expected draws. Exact die value 14/3. Closed-form reservation values for uniform with cost, uniform with discount, and normal with cost. |
 | **Matrix games** | Matching pennies, RPS, 2×2 closed form, saddle points, fractional entries, and **40 random games up to 7×7 with the duality certificate re-verified independently** in the test. |
+| **Almgren–Chriss** | κ and trajectory vs the independent sinh closed form (paper example: κ = 0.6063). TWAP cost exactly 662,500. λ = 0 gives TWAP. Urgency is monotone (E↑, V↓). The optimum beats 200 random perturbations. **A direct simulation of the AC price process reproduces E and Var.** Buy/sell symmetry, the `kyle_lambda` alias, and rejection of $\tilde\eta \le 0$. |
+| **Longstaff–Schwartz** | Python backend vs the converged Bermudan CRR (LS Table 1). NumPy backend with **low bias across 6 seeds**. Backends agree. Boundary within 1.5 of CRR. An American call with q = 0 equals the European (< 2% early exercise). Basis choices agree. Determinism. Budget errors. Graceful fallback when NumPy is requested but missing. |
+| **Black–Litterman** | **Matches the independent precision-form posterior** (mean and covariance) to 10⁻¹². No-view identities ($w_{\text{mkt}}$, $w_{\text{mkt}}/(1+\tau)$). Gap closed is monotone in confidence (= ½ at c = ½, = 1 at c = 1). Tilt lies in span($P^\top$). Long-only KKT plus brute-force dominance over 3,000 feasible portfolios. Error paths (non-PD, unknown asset, infeasible cap, dependent certain views). |
+| **EV trainer** | Deterministic generation that hides the answer. A 300-puzzle sweep: valid probability measures, the verdict rule, the Kelly first-order condition, all three verdicts occurring. Brute-force cross-checks (ev_calculator, Pig 8.14179, every card hand, every auction bid, a martingale simulation). Scoring: perfect = 100, wrong tag, rounded EV, full-Kelly half credit, hedge ratio, strict-tag rejection. |
 | **EV & order book** | Every puzzle against its known exact answer. HTH waiting time cross-checked by simulation. Microprice, imbalance, walk-the-book, crossed-book detection. |
 | **Robustness (fuzz)** | ~2,500 randomised calls across all tools with adversarial values (NaN, ±∞, 1e308, `"1/0"`, `"1e999999"`, booleans, wrong container types, 10³⁰). Every response must be **strict JSON** (no NaN tokens), carry `ok`, and **never** be an `internal error`. Handlers also accept extra kwargs. |
 
@@ -816,6 +1063,10 @@ hermes plugins validate .
 | CRR American put, 5 steps (Hull) | 4.4885 | 4.488459 | < 5·10⁻⁵ |
 | American put, ATM 1y, N = 1000 | ≈ 6.0904 | 6.0896 (6.0916 with CV) | ≈ 10⁻³ |
 | Heston (Fang–Oosterlee 2008) | 5.785155450 | 5.785155431 | 2·10⁻⁸ |
+| Almgren–Chriss κ (AC 2000 example) | ≈ 0.6 | 0.6063 | (closed form, residual 10⁻¹⁶) |
+| LSM put, S=36 K=40, 50 dates (12 × 100k paths) | 4.4780 (Bermudan CRR) | 4.4748 ± 0.0024 | −0.003 (expected low bias) |
+| Black–Litterman posterior vs precision form | — | — | 1.4·10⁻¹⁷ |
+| Pig d6, hold at 20 | 8.14179 | 492303203/60466176 | exact |
 | Arithmetic Asian, 52 fixings | (no closed form) | 5.85514 ± 0.00168 | — |
 | DOC barrier H=90, continuous | 8.66547 | 8.6268 ± 0.0400 | z = −0.97 |
 | Secretary n = 10 | 3349/8400 | 3349/8400 | exact |
@@ -835,6 +1086,10 @@ hermes plugins validate .
 | Avellaneda–Stoikov | Assumes arithmetic-BM mid, exponential fill intensity and CARA utility. Model inputs ($k$, $A$, σ) must be estimated from your venue's data. |
 | VPIN | Per-trade BVC variant. The 0.2 / 0.4 levels are heuristics; alert on the CDF percentile against your own history. |
 | Matrix games | Returns one optimal vertex when the equilibrium is not unique. |
+| Almgren–Chriss | Linear impact, arithmetic random walk, static (pre-committed) schedule; no adaptive or intraday-volume-curve execution. Impact parameters must be calibrated to your venue. |
+| Longstaff–Schwartz | GBM only. `std_error` is conditional on the fitted policy (regression noise excluded, so compare seeds). The European control variate gives only 1.1–2.2× for American puts. The pure-Python budget is 10⁶ path-dates. |
+| Black–Litterman | Normal returns, static single-period mean-variance. The confidence→Ω mapping is the proportional (He–Litterman-scaled) one, not Idzorek's iterative calibration. |
+| EV trainer | Puzzle families are fixed templates with randomised parameters. HEDGE puzzles occur at difficulty ≥ 2 (≈5% of conditional-expectation puzzles). |
 | Enforcement | The audit is syntactic (format, not truth). |
 | Scope | **Not investment advice and not an execution system.** No market data access, order routing or position keeping. |
 
@@ -848,10 +1103,10 @@ hermes plugins validate .
 ├── README.md
 └── waterloo-jane-street-qr/
     ├── plugin.yaml                  manifest v2: tools, hooks, config_schema (enforcement)
-    ├── __init__.py                  ~2.4k LOC: validation, kernels, 10 tools, persona, hooks, register()
+    ├── __init__.py                  ~4.1k LOC: validation, kernels, 14 tools, persona, hooks, register()
     ├── .gitignore                   __pycache__/, *.pyc, .pytest_cache/
     └── tests/
-        └── test_plugin.py           53 tests (pytest or standalone)
+        └── test_plugin.py           81 tests (pytest or standalone; NumPy tests skip cleanly)
 ```
 
 ---
@@ -870,6 +1125,11 @@ hermes plugins validate .
 - Guéant, O., Lehalle, C.-A. & Fernandez-Tapia, J. (2013). *Dealing with the inventory risk.* Math. Financ. Econ.
 - Easley, D., López de Prado, M. & O'Hara, M. (2012). *Flow toxicity and liquidity in a high-frequency world.* RFS.
 - Kyle, A. (1985). *Continuous auctions and insider trading.* Econometrica.
+- Almgren, R. & Chriss, N. (2000). *Optimal execution of portfolio transactions.* J. Risk.
+- Longstaff, F. & Schwartz, E. (2001). *Valuing American options by simulation: a simple least-squares approach.* RFS.
+- Black, F. & Litterman, R. (1992). *Global portfolio optimization.* FAJ.
+- He, G. & Litterman, R. (1999). *The intuition behind Black-Litterman model portfolios.* Goldman Sachs.
+- Beck, A. & Teboulle, M. (2009). *A fast iterative shrinkage-thresholding algorithm.* SIAM J. Imaging Sci.
 - Hull, J. *Options, Futures, and Other Derivatives.*
 
 ---

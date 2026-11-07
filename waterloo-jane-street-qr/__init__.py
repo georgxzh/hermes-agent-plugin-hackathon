@@ -10,6 +10,12 @@ Derivatives & volatility
                              Heston trap" CF), implied-vol smile, Feller check, Delta/Gamma.
   monte_carlo_engine         GBM Monte Carlo with antithetic variates (+ control variates)
                              for Asian, barrier and European options with analytic benchmarks.
+  longstaff_schwartz_american  Least-squares Monte Carlo (Laguerre regression) for American /
+                             Bermudan options; in/out-of-sample estimators, CRR benchmarks.
+                             NumPy-vectorised when NumPy is installed, pure Python otherwise.
+Execution & portfolio construction
+  almgren_chriss_liquidation Optimal execution trajectory, cost/risk frontier (Almgren-Chriss).
+  black_litterman_optimizer  Equilibrium + views posterior and constrained allocations.
 Market making & microstructure
   order_book_metrics         Mid, spread, microprice, imbalance, depth, walk-the-book impact.
   avellaneda_stoikov_quotes  Reservation price + optimal bid/ask (AS 2008, GLFT asymptotics).
@@ -20,6 +26,7 @@ Probability, stopping & games
                              horizon, search cost, discounting).
   matrix_game_solver         Exact mixed-strategy Nash equilibrium of zero-sum matrix games
                              (rational simplex + LP duality certificate).
+  jane_street_ev_trainer     Seed-reproducible interview puzzles: generate -> check (graded) -> solve.
 
 Context & enforcement
 ---------------------
@@ -40,11 +47,19 @@ import logging
 import math
 import random
 import re
+import itertools
 import time
+from array import array as _array
 from fractions import Fraction
+from operator import mul as _mul
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
+
+try:  # optional accelerator: vectorises Longstaff-Schwartz path simulation + regressions
+    import numpy as _np
+except Exception:  # pragma: no cover - zero-dependency fallback
+    _np = None
 
 TOOLSET = "waterloo_qr"
 
@@ -963,8 +978,10 @@ ORDER_BOOK_SCHEMA = {
 # ════════════════════════════════════════════════════════════════════════
 
 def _crr_tree(S: float, K: float, T: float, r: float, q: float, sigma: float, N: int,
-              kind: str, with_european: bool = True, with_boundary: bool = True) -> Dict[str, Any]:
-    """One backward pass pricing American (and European) options on the same CRR lattice."""
+              kind: str, with_european: bool = True, with_boundary: bool = True,
+              exercise_every: int = 1) -> Dict[str, Any]:
+    """One backward pass pricing American (and European) options on the same CRR lattice.
+    exercise_every > 1 restricts exercise to every k-th step (Bermudan)."""
     dt = T / N
     vs = sigma * math.sqrt(dt)
     u = math.exp(vs)
@@ -995,7 +1012,7 @@ def _crr_tree(S: float, K: float, T: float, r: float, q: float, sigma: float, N:
         for j in range(i + 1):
             cont = pu * am[j + 1] + pd * am[j]
             ex = sgn * (spot_at[base + 2 * j] - K)
-            if ex > cont and ex > 0.0:
+            if ex > cont and ex > 0.0 and i % exercise_every == 0:
                 am[j] = ex
                 if with_boundary:
                     s_node = spot_at[base + 2 * j]
@@ -2261,6 +2278,1636 @@ MONTE_CARLO_SCHEMA = {
 
 
 # ════════════════════════════════════════════════════════════════════════
+# Shared dense linear algebra (pure Python; matrices here are <= 60x60)
+# ════════════════════════════════════════════════════════════════════════
+
+def _chol(A: List[List[float]], what: str = "matrix") -> List[List[float]]:
+    """Cholesky factor L (A = L L^T); raises ToolInputError if A is not positive definite."""
+    n = len(A)
+    L = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1):
+            s = A[i][j] - math.fsum(L[i][k] * L[j][k] for k in range(j))
+            if i == j:
+                if not s > 1e-14 * max(1.0, abs(A[i][i])):
+                    raise ToolInputError(f"{what} is not positive definite")
+                L[i][i] = math.sqrt(s)
+            else:
+                L[i][j] = s / L[j][j]
+    return L
+
+
+def _chol_solve(L: List[List[float]], b: Sequence[float]) -> List[float]:
+    n = len(L)
+    y = [0.0] * n
+    for i in range(n):
+        y[i] = (b[i] - math.fsum(L[i][k] * y[k] for k in range(i))) / L[i][i]
+    x = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        x[i] = (y[i] - math.fsum(L[k][i] * x[k] for k in range(i + 1, n))) / L[i][i]
+    return x
+
+
+def _matvec(A: Sequence[Sequence[float]], x: Sequence[float]) -> List[float]:
+    return [math.fsum(map(_mul, row, x)) for row in A]
+
+
+def _matmul(A: Sequence[Sequence[float]], B: Sequence[Sequence[float]]) -> List[List[float]]:
+    cols = list(zip(*B))
+    return [[math.fsum(map(_mul, row, c)) for c in cols] for row in A]
+
+
+def _dot(a: Sequence[float], b: Sequence[float]) -> float:
+    return math.fsum(map(_mul, a, b))
+
+
+def _quad(x: Sequence[float], A: Sequence[Sequence[float]]) -> float:
+    return _dot(x, _matvec(A, x))
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 11. Almgren-Chriss optimal liquidation
+# ════════════════════════════════════════════════════════════════════════
+
+def _ac_kappa(lam: float, sigma: float, eta_t: float, tau: float) -> float:
+    """kappa from cosh(kappa*tau) = 1 + kappa_tilde^2 tau^2 / 2, kappa_tilde^2 = lam sigma^2 / eta_tilde."""
+    if lam <= 0 or sigma <= 0:
+        return 0.0
+    x = 0.5 * (lam * sigma * sigma / eta_t) * tau * tau
+    return math.log1p(x + math.sqrt(x * (x + 2.0))) / tau  # acosh(1 + x), stable for tiny x
+
+
+def _ac_holdings(X: float, kappa: float, T: float, N: int) -> List[float]:
+    """x_k = X sinh(kappa (T - t_k)) / sinh(kappa T), in an overflow-free exponential form."""
+    tau = T / N
+    if kappa * T < 1e-12:
+        return [X * (1.0 - k / N) for k in range(N + 1)]
+    den = -math.expm1(-2.0 * kappa * T)
+    out = [X * math.exp(-kappa * k * tau) * (-math.expm1(-2.0 * kappa * (T - k * tau))) / den
+           for k in range(N + 1)]
+    out[0], out[-1] = X, 0.0
+    return out
+
+
+def _ac_stats(x: List[float], tau: float, gamma: float, eta_t: float, eps: float, sigma: float,
+              lam: float) -> Tuple[List[float], float, float, float]:
+    n = [x[k - 1] - x[k] for k in range(1, len(x))]
+    X = x[0]
+    E = 0.5 * gamma * X * X + eps * math.fsum(abs(v) for v in n) + (eta_t / tau) * math.fsum(v * v for v in n)
+    V = sigma * sigma * tau * math.fsum(v * v for v in x[1:])
+    return n, E, V, E + lam * V
+
+
+def _almgren_chriss_liquidation(args: dict) -> Dict[str, Any]:
+    """Optimal discrete-time execution trajectory (Almgren & Chriss, 2000)."""
+    X = _num(args, "shares", required=True, lo=-1e12, hi=1e12)
+    if X == 0:
+        raise ToolInputError("'shares' must be non-zero (positive = sell/liquidate, negative = buy)")
+    T = _num(args, "horizon", required=True, lo=0, lo_inclusive=False, hi=1e6)
+    N = _int(args, "periods", 10, lo=1, hi=10_000)
+    sigma = _num(args, "volatility", required=True, lo=0, hi=1e9)
+    if args.get("permanent_impact") is not None and args.get("kyle_lambda") is not None:
+        raise ToolInputError("pass either 'permanent_impact' or its alias 'kyle_lambda', not both")
+    gkey = "kyle_lambda" if args.get("kyle_lambda") is not None else "permanent_impact"
+    gamma = _num(args, gkey, 0.0, lo=0, hi=1e9)
+    eta = _num(args, "temporary_impact", required=True, lo=0, lo_inclusive=False, hi=1e9)
+    eps = _num(args, "fixed_cost", 0.0, lo=0, hi=1e9)
+    lam = _num(args, "risk_aversion", required=True, lo=0, hi=1e9)
+    S0 = _num(args, "spot", None, lo=0, lo_inclusive=False)
+    rows_max = _int(args, "max_schedule_rows", 60, lo=2, hi=1000)
+
+    tau = T / N
+    eta_t = eta - 0.5 * gamma * tau
+    if eta_t <= 0:
+        raise ToolInputError(
+            f"need temporary_impact > permanent_impact*tau/2 = {0.5 * gamma * tau:.6g} "
+            "(eta_tilde = eta - gamma*tau/2 must be > 0); increase 'periods' or check units")
+    kappa = _ac_kappa(lam, sigma, eta_t, tau)
+    x = _ac_holdings(X, kappa, T, N)
+    n, E, V, U = _ac_stats(x, tau, gamma, eta_t, eps, sigma, lam)
+
+    x_twap = _ac_holdings(X, 0.0, T, N)
+    _, Et, Vt, Ut = _ac_stats(x_twap, tau, gamma, eta_t, eps, sigma, lam)
+    x_now = [X] + [0.0] * N
+    _, Ei, Vi, Ui = _ac_stats(x_now, tau, gamma, eta_t, eps, sigma, lam)
+
+    kt2 = lam * sigma * sigma / eta_t
+    scale = abs(X) * (kt2 + 1.0 / (tau * tau))
+    el_resid = max((abs((x[k - 1] - 2 * x[k] + x[k + 1]) / (tau * tau) - kt2 * x[k])
+                    for k in range(1, N)), default=0.0) / scale
+
+    if N + 1 <= rows_max:
+        idx = list(range(N + 1))
+    else:
+        idx = sorted({round(i * N / (rows_max - 1)) for i in range(rows_max)})
+    schedule = []
+    for k in idx:
+        row: Dict[str, Any] = {"period": k, "time": k * tau, "holdings": x[k],
+                               "pct_executed": 100.0 * (1.0 - x[k] / X)}
+        if k >= 1:
+            row["trade"] = n[k - 1]
+            row["trade_rate"] = n[k - 1] / tau
+        schedule.append(row)
+
+    def pack(e: float, v: float, u: float) -> Dict[str, Any]:
+        d = {"expected_cost": e, "variance": v, "cost_std": math.sqrt(v), "utility": u}
+        if S0:
+            d["expected_cost_bps"] = e / (abs(X) * S0) * 1e4
+            d["cost_std_bps"] = math.sqrt(v) / (abs(X) * S0) * 1e4
+        return d
+
+    frontier = None
+    if sigma > 0:
+        base = lam if lam > 0 else eta_t / (sigma * sigma * T * T)  # lam with kappa*T ~ 1
+        pts = []
+        for i in [None] + list(range(13)):
+            li = 0.0 if i is None else base * 10 ** ((i - 6) / 2)
+            xi = _ac_holdings(X, _ac_kappa(li, sigma, eta_t, tau), T, N)
+            _, e_, v_, _u = _ac_stats(xi, tau, gamma, eta_t, eps, sigma, li)
+            pts.append({"risk_aversion": li, "expected_cost": e_, "cost_std": math.sqrt(v_)})
+        frontier = sorted(pts, key=lambda p: p["cost_std"])
+
+    out: Dict[str, Any] = {
+        "model": "Almgren-Chriss (2000): arithmetic random walk, linear permanent impact g(v)=gamma*v, "
+                 "linear temporary impact h(v)=eps*sgn(v)+eta*v, mean-variance objective E + lambda*V",
+        "side": "sell (liquidation)" if X > 0 else "buy (acquisition)",
+        "inputs": {"shares": X, "horizon": T, "periods": N, "volatility": sigma, "permanent_impact": gamma,
+                   "temporary_impact": eta, "fixed_cost": eps, "risk_aversion": lam, "spot": S0},
+        "derived": {"tau": tau, "eta_tilde": eta_t, "kappa_tilde_sq": kt2, "kappa": kappa,
+                    "urgency_kappa_T": kappa * T,
+                    "decay_time_1_over_kappa": (1.0 / kappa) if kappa > 0 else None},
+        "optimal": pack(E, V, U),
+        "cost_breakdown": {"permanent": 0.5 * gamma * X * X, "fixed": eps * math.fsum(abs(v) for v in n),
+                           "temporary": (eta_t / tau) * math.fsum(v * v for v in n)},
+        "pct_executed_first_half": 100.0 * (1.0 - x[N // 2] / X) if N >= 2 else 100.0,
+        "schedule": schedule,
+        "benchmarks": {"twap": pack(Et, Vt, Ut), "immediate": pack(Ei, Vi, Ui)},
+        "optimality_certificate": {
+            "euler_lagrange_max_rel_residual": el_resid,
+            "utility_saving_vs_twap": Ut - U,
+            "utility_saving_vs_immediate": Ui - U,
+            "beats_twap": U <= Ut * (1 + 1e-12) + 1e-12,
+            "beats_immediate": U <= Ui * (1 + 1e-12) + 1e-12,
+            "explanation": "U(x) is a strictly convex quadratic in x_1..x_{N-1}; x_k solves the discrete "
+                           "Euler-Lagrange equation (x_{k-1}-2x_k+x_{k+1})/tau^2 = kappa_tilde^2 x_k exactly",
+        },
+        "formulas": {
+            "trajectory": "x_k = X sinh(kappa (T - t_k)) / sinh(kappa T); cosh(kappa tau) = 1 + kappa_tilde^2 tau^2/2",
+            "expected_cost": "E = gamma X^2/2 + eps sum|n_k| + (eta_tilde/tau) sum n_k^2",
+            "variance": "V = sigma^2 tau sum_{k=1..N} x_k^2",
+        },
+    }
+    if frontier:
+        out["efficient_frontier"] = frontier
+    warnings = []
+    if kappa * tau > 3:
+        warnings.append("kappa*tau > 3: the optimum dumps most of the block in the first period; refine "
+                        "'periods' (the discrete schedule is coarse relative to the urgency).")
+    if gkey == "kyle_lambda":
+        out["note"] = ("kyle_lambda used as the permanent impact gamma (price move per share traded) - e.g. "
+                       "the 'kyle_lambda' estimate from order_flow_toxicity, if its volume units are shares.")
+    if warnings:
+        out["warnings"] = warnings
+    return out
+
+
+ALMGREN_CHRISS_SCHEMA = {
+    "name": "almgren_chriss_liquidation",
+    "description": (
+        "Optimal execution of a large block (Almgren-Chriss 2000): trade schedule minimising expected "
+        "implementation shortfall + risk_aversion * variance under linear permanent (Kyle lambda) and temporary "
+        "impact. Returns the trajectory, expected cost/std (and bps), cost breakdown, TWAP and immediate-"
+        "execution benchmarks, an efficient frontier and an optimality certificate. Units: volatility is "
+        "ABSOLUTE price vol per sqrt(time unit) (30% annual on $50, daily periods: 0.3*50/sqrt(250)=0.95); "
+        "permanent_impact $/share per share; temporary_impact $/share per (share/time unit); risk_aversion 1/$."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "shares": {"type": "number", "description": "Block size X (positive = sell, negative = buy)."},
+            "horizon": {"type": "number", "description": "Execution horizon T in time units (e.g. days)."},
+            "periods": {"type": "integer", "description": "Number of trading intervals N (default 10, max 10000)."},
+            "volatility": {"type": "number", "description": "Absolute price volatility sigma per sqrt(time unit)."},
+            "permanent_impact": {"type": "number", "description": "gamma: permanent price impact per share traded (default 0)."},
+            "kyle_lambda": {"type": "number", "description": "Alias for permanent_impact (Kyle's lambda)."},
+            "temporary_impact": {"type": "number", "description": "eta: temporary impact per unit trading rate (> 0)."},
+            "fixed_cost": {"type": "number", "description": "eps: fixed cost per share, e.g. half-spread + fees (default 0)."},
+            "risk_aversion": {"type": "number", "description": "lambda (>= 0); 0 = risk-neutral = TWAP."},
+            "spot": {"type": "number", "description": "Optional arrival price, to report costs in bps of notional."},
+            "max_schedule_rows": {"type": "integer", "description": "Max rows in the returned schedule (default 60)."},
+        },
+        "required": ["shares", "horizon", "volatility", "temporary_impact", "risk_aversion"],
+    },
+}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 12. Longstaff-Schwartz least-squares Monte Carlo (American / Bermudan)
+# ════════════════════════════════════════════════════════════════════════
+
+_LSM_MIN_ROWS = 12
+
+
+def _lsm_features_py(xs: Sequence[float], degree: int, basis: str) -> List[List[float]]:
+    m = len(xs)
+    cols = [[1.0] * m]
+    if basis == "monomial":
+        for k in range(1, degree + 1):
+            cols.append([v ** k for v in xs])
+        return cols
+    w = [math.exp(-0.5 * v) for v in xs] if basis == "laguerre" else [1.0] * m
+    l_prev, l_cur = [1.0] * m, [1.0 - v for v in xs]
+    lag = [l_prev, l_cur]
+    for n in range(1, degree - 1):
+        l_prev, l_cur = l_cur, [((2 * n + 1 - v) * a - n * b) / (n + 1) for v, a, b in zip(xs, l_cur, l_prev)]
+        lag.append(l_cur)
+    for k in range(degree):
+        cols.append([wi * li for wi, li in zip(w, lag[k])])
+    return cols
+
+
+def _ls_solve_py(cols: List[List[float]], y: Sequence[float]) -> List[float]:
+    """Least squares via column-scaled normal equations + Cholesky (with tiny ridge fallback)."""
+    p = len(cols)
+    G = [[math.fsum(map(_mul, cols[i], cols[j])) for j in range(p)] for i in range(p)]
+    b = [math.fsum(map(_mul, c, y)) for c in cols]
+    s = [math.sqrt(G[i][i]) if G[i][i] > 0 else 1.0 for i in range(p)]
+    Gs = [[G[i][j] / (s[i] * s[j]) for j in range(p)] for i in range(p)]
+    bs = [b[i] / s[i] for i in range(p)]
+    ridge = 0.0
+    for _ in range(8):
+        try:
+            L = _chol([[Gs[i][j] + (ridge if i == j else 0.0) for j in range(p)] for i in range(p)], "Gram")
+            z = _chol_solve(L, bs)
+            return [z[i] / s[i] for i in range(p)]
+        except ToolInputError:
+            ridge = 1e-12 if ridge == 0.0 else ridge * 100
+    return [0.0] * p
+
+
+def _fitted_py(cols: List[List[float]], beta: Sequence[float]) -> List[float]:
+    out = [beta[0] * v for v in cols[0]]
+    for c, bk in zip(cols[1:], beta[1:]):
+        out = [o + bk * v for o, v in zip(out, c)]
+    return out
+
+
+def _lsm_python(S, K, T, r, q, sigma, kind, M, N, seed, antithetic, degree, basis, oos):
+    dt = T / N
+    drift, vol, disc = (r - q - 0.5 * sigma * sigma) * dt, sigma * math.sqrt(dt), math.exp(-r * dt)
+    sgn = 1.0 if kind == "call" else -1.0
+    half = M // 2 if antithetic else M
+
+    def step(prev, gauss):
+        z = [gauss(0.0, 1.0) for _ in range(half)]
+        if antithetic:
+            z += [-v for v in z]
+        return _array("d", [p * math.exp(drift + vol * zi) for p, zi in zip(prev, z)])
+
+    rng = random.Random(seed)
+    cols = [_array("d", [S]) * M]
+    for _ in range(N):
+        cols.append(step(cols[-1], rng.gauss))
+    cf = [max(sgn * (s - K), 0.0) for s in cols[N]]
+    ex_t = [N if v > 0 else -1 for v in cf]
+    betas: List[Optional[List[float]]] = [None] * (N + 1)
+    itm_range: List[Optional[Tuple[float, float]]] = [None] * (N + 1)
+    for t in range(N - 1, 0, -1):
+        cf = [v * disc for v in cf]
+        St = cols[t]
+        idx = [i for i in range(M) if sgn * (St[i] - K) > 0]
+        if len(idx) < max(_LSM_MIN_ROWS, 3 * (degree + 1)):
+            continue
+        feats = _lsm_features_py([St[i] / K for i in idx], degree, basis)
+        beta = _ls_solve_py(feats, [cf[i] for i in idx])
+        betas[t] = beta
+        itm_range[t] = (min(St[i] for i in idx), max(St[i] for i in idx))
+        for j, cont in zip(idx, _fitted_py(feats, beta)):
+            iv = sgn * (St[j] - K)
+            if iv > cont:
+                cf[j], ex_t[j] = iv, t
+    values = [v * disc for v in cf]
+    euro = [max(sgn * (s - K), 0.0) * disc ** N for s in cols[N]]
+    res = {"values": values, "euro": euro, "ex_t": ex_t, "betas": betas, "itm_range": itm_range}
+    if oos:
+        rng2 = random.Random(seed + 7_919_993)
+        prev = _array("d", [S]) * M
+        alive = [True] * M
+        val = [0.0] * M
+        dfac = 1.0
+        for t in range(1, N + 1):
+            prev = step(prev, rng2.gauss)
+            dfac *= disc
+            if t < N and betas[t] is not None:
+                idx = [i for i in range(M) if alive[i] and sgn * (prev[i] - K) > 0]
+                if idx:
+                    feats = _lsm_features_py([prev[i] / K for i in idx], degree, basis)
+                    for j, cont in zip(idx, _fitted_py(feats, betas[t])):  # type: ignore[arg-type]
+                        iv = sgn * (prev[j] - K)
+                        if iv > cont:
+                            val[j], alive[j] = iv * dfac, False
+        for i in range(M):
+            if alive[i]:
+                val[i] = max(sgn * (prev[i] - K), 0.0) * dfac
+        res["oos_values"] = val
+        res["oos_euro"] = [max(sgn * (s - K), 0.0) * dfac for s in prev]
+    return res
+
+
+def _lsm_features_np(x, degree: int, basis: str):
+    np = _np
+    cols = [np.ones_like(x)]
+    if basis == "monomial":
+        cols += [x ** k for k in range(1, degree + 1)]
+        return np.column_stack(cols)
+    w = np.exp(-0.5 * x) if basis == "laguerre" else np.ones_like(x)
+    lag = [np.ones_like(x), 1.0 - x]
+    for n in range(1, degree - 1):
+        lag.append(((2 * n + 1 - x) * lag[-1] - n * lag[-2]) / (n + 1))
+    cols += [w * lag[k] for k in range(degree)]
+    return np.column_stack(cols)
+
+
+def _lsm_numpy(S, K, T, r, q, sigma, kind, M, N, seed, antithetic, degree, basis, oos):
+    np = _np
+    dt = T / N
+    drift, vol, disc = (r - q - 0.5 * sigma * sigma) * dt, sigma * math.sqrt(dt), math.exp(-r * dt)
+    sgn = 1.0 if kind == "call" else -1.0
+    half = M // 2 if antithetic else M
+
+    def increments(gen):
+        z = gen.standard_normal((N, half))
+        if antithetic:
+            z = np.concatenate([z, -z], axis=1)
+        return drift + vol * z
+
+    gen = np.random.default_rng(seed)
+    paths = np.empty((N + 1, M))
+    paths[0] = math.log(S)
+    paths[1:] = increments(gen)
+    np.cumsum(paths, axis=0, out=paths)  # log-prices, in place
+    np.exp(paths, out=paths)
+    cf = np.maximum(sgn * (paths[N] - K), 0.0)
+    ex_t = np.where(cf > 0, N, -1)
+    betas: List[Optional[Any]] = [None] * (N + 1)
+    itm_range: List[Optional[Tuple[float, float]]] = [None] * (N + 1)
+    for t in range(N - 1, 0, -1):
+        cf *= disc
+        iv = sgn * (paths[t] - K)
+        itm = iv > 0
+        if int(itm.sum()) < max(_LSM_MIN_ROWS, 3 * (degree + 1)):
+            continue
+        X = _lsm_features_np(paths[t][itm] / K, degree, basis)
+        beta, *_ = np.linalg.lstsq(X, cf[itm], rcond=None)
+        betas[t] = beta
+        itm_range[t] = (float(paths[t][itm].min()), float(paths[t][itm].max()))
+        ex = np.zeros(M, dtype=bool)
+        ex[itm] = iv[itm] > X @ beta
+        cf[ex] = iv[ex]
+        ex_t[ex] = t
+    res = {"values": cf * disc, "euro": np.maximum(sgn * (paths[N] - K), 0.0) * disc ** N,
+           "ex_t": ex_t, "betas": betas, "itm_range": itm_range}
+    if oos:
+        gen2 = np.random.default_rng(seed + 7_919_993)
+        lp = np.full(M, math.log(S))
+        alive = np.ones(M, dtype=bool)
+        val = np.zeros(M)
+        inc = increments(gen2)
+        for t in range(1, N + 1):
+            lp += inc[t - 1]
+            if t < N and betas[t] is not None:
+                s_t = np.exp(lp)
+                iv = sgn * (s_t - K)
+                cand = alive & (iv > 0)
+                if cand.any():
+                    cont = _lsm_features_np(s_t[cand] / K, degree, basis) @ betas[t]
+                    ex = np.zeros(M, dtype=bool)
+                    ex[cand] = iv[cand] > cont
+                    val[ex] = iv[ex] * disc ** t
+                    alive &= ~ex
+        s_T = np.exp(lp)
+        payT = np.maximum(sgn * (s_T - K), 0.0) * disc ** N
+        val[alive] = payT[alive]
+        res["oos_values"], res["oos_euro"] = val, payT
+    return res
+
+
+def _lsm_estimate(values, euro, cv_mean: float, antithetic: bool, use_cv: bool) -> Dict[str, Any]:
+    v = [float(a) for a in values]
+    e = [float(a) for a in euro]
+    if antithetic:
+        h = len(v) // 2
+        v = [0.5 * (v[i] + v[i + h]) for i in range(h)]
+        e = [0.5 * (e[i] + e[i + h]) for i in range(h)]
+    n = len(v)
+    mean, var = _mean_var(v)
+    out: Dict[str, Any] = {"price_raw": mean, "std_error_raw": math.sqrt(var / n)}
+    price, se = mean, math.sqrt(var / n)
+    if use_cv:
+        mx, vx = _mean_var(e)
+        if vx > 0:
+            cov = math.fsum((a - mean) * (b - mx) for a, b in zip(v, e)) / (n - 1)
+            beta = cov / vx
+            adj = [a - beta * (b - cv_mean) for a, b in zip(v, e)]
+            price, avar = _mean_var(adj)
+            se = math.sqrt(avar / n)
+            out["control_variate"] = {"control": "European payoff on the same paths (Black-Scholes mean)",
+                                      "beta": beta, "variance_reduction_factor": var / avar if avar > 0 else None}
+    out["price"], out["std_error"] = price, se
+    return out
+
+
+def _longstaff_schwartz_american(args: dict) -> Dict[str, Any]:
+    """Least-squares Monte Carlo for American/Bermudan options."""
+    S = _num(args, "spot", required=True, lo=0, lo_inclusive=False)
+    K = _num(args, "strike", required=True, lo=0, lo_inclusive=False)
+    T = _num(args, "time_to_maturity", required=True, lo=0, lo_inclusive=False, hi=30)
+    r = _num(args, "risk_free_rate", required=True, lo=-1, hi=5)
+    sigma = _num(args, "volatility", required=True, lo=0, lo_inclusive=False, hi=5)
+    q = _num(args, "dividend_yield", 0.0, lo=-1, hi=5)
+    kind = _choice(args, "option_type", ("call", "put"), "put")
+    N = _int(args, "exercise_dates", 50, lo=1, hi=500)
+    basis = _choice(args, "basis", ("laguerre", "laguerre_unweighted", "monomial"), "laguerre")
+    degree = _int(args, "degree", 3, lo=1, hi=6)
+    seed = _int(args, "seed", 42, lo=0, hi=2**63 - 1)
+    antithetic = _bool(args, "antithetic", True)
+    oos = _bool(args, "out_of_sample", True)
+    use_cv = _bool(args, "control_variate", True)
+    want_bench = _bool(args, "benchmark", True)
+    npts = _int(args, "boundary_points", 10, lo=0, hi=100)
+    backend_req = _choice(args, "backend", ("auto", "numpy", "python"), "auto")
+    warnings: List[str] = []
+    backend = "numpy" if (backend_req in ("auto", "numpy") and _np is not None) else "python"
+    if backend_req == "numpy" and _np is None:
+        warnings.append("backend='numpy' requested but NumPy is not installed; used the pure-Python backend.")
+    default_paths = 50_000 if backend == "numpy" else 20_000
+    M = _int(args, "paths", default_paths, lo=200, hi=5_000_000)
+    if antithetic and M % 2:
+        M += 1
+    budget = 5_000_000 if backend == "numpy" else 1_000_000
+    if M * N > budget:
+        raise ToolInputError(f"paths*exercise_dates = {M * N:,} exceeds the {backend} backend budget of "
+                             f"{budget:,}" + ("" if backend == "numpy" else " (install NumPy for 5x more)"))
+    if not 1e-3 <= S / K <= 1e3:
+        raise ToolInputError("spot/strike ratio must be within [1e-3, 1e3]")
+
+    t0 = time.perf_counter()
+    run = _lsm_numpy if backend == "numpy" else _lsm_python
+    res = run(S, K, T, r, q, sigma, kind, M, N, seed, antithetic, degree, basis, oos)
+    bs_eu = _bs_core(S, K, T, r, sigma, q)[kind]["price"]
+    ins = _lsm_estimate(res["values"], res["euro"], bs_eu, antithetic, use_cv)
+    est = ins
+    out_sample = None
+    if oos:
+        out_sample = _lsm_estimate(res["oos_values"], res["oos_euro"], bs_eu, antithetic, use_cv)
+        est = out_sample
+    intrinsic = max((S - K) if kind == "call" else (K - S), 0.0)
+    price = max(est["price"], intrinsic)
+
+    ex_t = [int(v) for v in res["ex_t"]]
+    dt = T / N
+    early = [t for t in ex_t if 0 < t < N]
+    exercised = [t for t in ex_t if t > 0]
+
+    betas = res["betas"]
+    dates = [t for t in range(1, N) if betas[t] is not None]
+    sgn = 1.0 if kind == "call" else -1.0
+    boundary = []
+    if npts and dates:
+        pick = sorted({dates[round(i * (len(dates) - 1) / max(npts - 1, 1))] for i in range(min(npts, len(dates)))})
+        for t in pick:
+            lo, hi = res["itm_range"][t]
+            beta = [float(b) for b in betas[t]]
+
+            def g(s: float) -> float:
+                feats = _lsm_features_py([s / K], degree, basis)
+                return sgn * (s - K) - math.fsum(b * c[0] for b, c in zip(beta, feats))
+
+            # Scan from the money toward deep ITM, where the regression is best populated; the first
+            # crossing intrinsic > continuation is the boundary (sparse deep-ITM tails are ignored).
+            grid = [K + (lo - K if kind == "put" else hi - K) * i / 256 for i in range(1, 257)]
+            crit = None
+            prev = K
+            for s_ in grid:
+                if g(s_) > 0:
+                    a, b_ = s_, prev  # g(a) > 0 >= g(b_)
+                    for _ in range(40):
+                        mid = 0.5 * (a + b_)
+                        a, b_ = (mid, b_) if g(mid) > 0 else (a, mid)
+                    crit = 0.5 * (a + b_)
+                    break
+                prev = s_
+            boundary.append({"time": t * dt, "critical_spot": crit})
+
+    out: Dict[str, Any] = {
+        "model": "Longstaff-Schwartz (2001) least-squares Monte Carlo on GBM under Q (Bermudan exercise "
+                 "on the simulation grid -> American as exercise_dates grows)",
+        "backend": f"numpy {_np.__version__}" if backend == "numpy" else "python",
+        "inputs": {"spot": S, "strike": K, "time_to_maturity_years": T, "risk_free_rate": r,
+                   "volatility": sigma, "dividend_yield": q, "option_type": kind},
+        "price": price,
+        "std_error": est["std_error"],
+        "ci95": [price - 1.96 * est["std_error"], price + 1.96 * est["std_error"]],
+        "estimator": "out_of_sample" if oos else "in_sample",
+        "std_error_note": "conditional on the fitted exercise policy: excludes regression (policy-estimation) "
+                          "noise, which adds roughly as much again; compare seeds for a full error bar",
+        "estimators": {
+            "in_sample": {**ins, "bias": "high (regression sees the same paths it prices: foresight)"},
+            **({"out_of_sample": {**out_sample, "bias": "low (fitted policy is sub-optimal; evaluated on "
+                                                         "independent paths)"}} if out_sample else {}),
+        },
+        "intrinsic_value": intrinsic,
+        "exercise_now_optimal": intrinsic > 0 and intrinsic >= est["price"],
+        "early_exercise": {
+            "probability_before_maturity": len(early) / len(ex_t),
+            "probability_exercised_at_all": len(exercised) / len(ex_t),
+            "expected_exercise_time_given_exercise": (math.fsum(exercised) / len(exercised) * dt) if exercised else None,
+        },
+        "regression": {"basis": basis, "degree": degree, "features": degree + 1,
+                       "regressor": "S/K on in-the-money paths only",
+                       "dates_with_regression": len(dates)},
+        "simulation": {"paths": M, "exercise_dates": N, "dt": dt, "seed": seed, "antithetic": antithetic},
+    }
+    if npts:
+        out["exercise_boundary"] = {
+            "rule": "exercise the put when spot <= critical_spot" if kind == "put"
+                    else "exercise the call when spot >= critical_spot",
+            "points": boundary,
+            "note": "first crossing of intrinsic over the fitted continuation, scanning from the strike; "
+                    "null = no exercise inside the simulated in-the-money range at that date",
+        }
+    bench: Dict[str, Any] = {"european_black_scholes": bs_eu}
+    if want_bench:
+        per = max(1, math.ceil(400 / N))
+        if N * per <= 2000:
+            try:
+                bench["bermudan_crr"] = _crr_tree(S, K, T, r, q, sigma, N * per, kind, with_european=False,
+                                                  with_boundary=False, exercise_every=per)["american"]
+                bench["american_crr_500"] = _crr_tree(S, K, T, r, q, sigma, 500, kind, with_european=False,
+                                                      with_boundary=False)["american"]
+            except ToolInputError as e:
+                warnings.append(f"CRR benchmark skipped: {e}")
+        if "bermudan_crr" in bench and est["std_error"] > 0:
+            bench["z_score_vs_bermudan_crr"] = (price - bench["bermudan_crr"]) / est["std_error"]
+    out["benchmarks"] = bench
+    out["early_exercise_premium_vs_european"] = price - bs_eu
+    if warnings:
+        out["warnings"] = warnings
+    out["runtime_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+    return out
+
+
+LSM_SCHEMA = {
+    "name": "longstaff_schwartz_american",
+    "description": (
+        "Price American/Bermudan options by Longstaff-Schwartz least-squares Monte Carlo: GBM paths "
+        "(antithetic), backward induction regressing discounted continuation values on (weighted) Laguerre "
+        "polynomials of S/K over in-the-money paths. Returns in-sample (high-biased) and out-of-sample "
+        "(low-biased) estimates with std errors and a European control variate, early-exercise statistics, "
+        "the exercise boundary, and Bermudan/American CRR benchmarks. NumPy-vectorised when available."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "spot": {"type": "number", "description": "Spot S (> 0)."},
+            "strike": {"type": "number", "description": "Strike K (> 0)."},
+            "time_to_maturity": {"type": "number", "description": "Years to expiry (> 0)."},
+            "risk_free_rate": {"type": "number", "description": "r, decimal."},
+            "volatility": {"type": "number", "description": "sigma, decimal (> 0)."},
+            "dividend_yield": {"type": "number", "description": "q, decimal. Default 0."},
+            "option_type": {"type": "string", "enum": ["call", "put"], "description": "Default 'put'."},
+            "exercise_dates": {"type": "integer", "description": "Exercise/simulation dates N (default 50, max 500)."},
+            "paths": {"type": "integer", "description": "Paths incl. antithetic (default 50000 numpy / 20000 python)."},
+            "basis": {"type": "string", "enum": ["laguerre", "laguerre_unweighted", "monomial"],
+                      "description": "Regression basis (default weighted Laguerre, as in Longstaff-Schwartz)."},
+            "degree": {"type": "integer", "description": "Number of basis functions besides the constant (1-6, default 3)."},
+            "seed": {"type": "integer", "description": "RNG seed (default 42)."},
+            "antithetic": {"type": "boolean", "description": "Antithetic variates (default true)."},
+            "out_of_sample": {"type": "boolean", "description": "Re-price the fitted policy on independent paths (default true)."},
+            "control_variate": {"type": "boolean", "description": "European control variate (default true)."},
+            "benchmark": {"type": "boolean", "description": "Compute CRR Bermudan/American benchmarks (default true)."},
+            "boundary_points": {"type": "integer", "description": "Exercise-boundary points to return (default 10)."},
+            "backend": {"type": "string", "enum": ["auto", "numpy", "python"], "description": "Default auto (NumPy if installed)."},
+        },
+        "required": ["spot", "strike", "time_to_maturity", "risk_free_rate", "volatility"],
+    },
+}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 13. Black-Litterman posterior returns + allocation
+# ════════════════════════════════════════════════════════════════════════
+
+def _proj_capped_simplex(v: List[float], ub: float) -> List[float]:
+    """Euclidean projection onto {w : sum w = 1, 0 <= w <= ub} (bisection on the shift)."""
+    lo, hi = min(v) - ub - 1.0, max(v) + 1.0
+    for _ in range(200):
+        th = 0.5 * (lo + hi)
+        s = math.fsum(min(max(x - th, 0.0), ub) for x in v)
+        if s > 1.0:
+            lo = th
+        else:
+            hi = th
+    th = 0.5 * (lo + hi)
+    return [min(max(x - th, 0.0), ub) for x in v]
+
+
+def _long_only_qp(mu: List[float], C: List[List[float]], delta: float, ub: float) -> Dict[str, Any]:
+    """max w'mu - delta/2 w'Cw  s.t. sum w = 1, 0 <= w <= ub. FISTA + exact active-set polish."""
+    n = len(mu)
+    v = [1.0 / math.sqrt(n)] * n
+    lmax = 1.0
+    for _ in range(200):  # power iteration for the Lipschitz constant
+        u = _matvec(C, v)
+        nu = math.sqrt(_dot(u, u))
+        if nu == 0:
+            break
+        v = [a / nu for a in u]
+        lmax = nu
+    L = max(delta * lmax * 1.01, 1e-12)
+    w = _proj_capped_simplex([1.0 / n] * n, ub)
+    y, t_k, it = w[:], 1.0, 0
+    for it in range(1, 20_001):
+        g = [delta * a - m for a, m in zip(_matvec(C, y), mu)]
+        w_new = _proj_capped_simplex([a - b / L for a, b in zip(y, g)], ub)
+        t_new = 0.5 * (1 + math.sqrt(1 + 4 * t_k * t_k))
+        y = [a + (t_k - 1) / t_new * (a - b) for a, b in zip(w_new, w)]
+        done = max(abs(a - b) for a, b in zip(w_new, w)) < 1e-14
+        w, t_k = w_new, t_new
+        if done:
+            break
+    # Active-set polish: solve the KKT system exactly on the identified free set.
+    tol = 1e-9
+    free = [i for i in range(n) if tol < w[i] < ub - tol]
+    capped = [i for i in range(n) if w[i] >= ub - tol]
+    if free:
+        try:
+            CF = [[C[i][j] for j in free] for i in free]
+            Lf = _chol(CF, "covariance block")
+            rhs = [mu[i] - delta * math.fsum(C[i][j] * ub for j in capped) for i in free]
+            a1 = _chol_solve(Lf, rhs)
+            a2 = _chol_solve(Lf, [1.0] * len(free))
+            budget = 1.0 - ub * len(capped)
+            nu = (math.fsum(a1) - delta * budget) / math.fsum(a2)
+            wf = [(x1 - nu * x2) / delta for x1, x2 in zip(a1, a2)]
+            if all(-1e-12 <= x <= ub + 1e-12 for x in wf):
+                cand = [0.0] * n
+                for i in capped:
+                    cand[i] = ub
+                for i, x in zip(free, wf):
+                    cand[i] = min(max(x, 0.0), ub)
+                w = cand
+        except ToolInputError:
+            pass
+    g = [delta * a - m for a, m in zip(_matvec(C, w), mu)]
+    fr = [i for i in range(n) if tol < w[i] < ub - tol]
+    nu = -math.fsum(g[i] for i in fr) / len(fr) if fr else -min(g)
+    viol = 0.0
+    for i in range(n):
+        if tol < w[i] < ub - tol:
+            viol = max(viol, abs(g[i] + nu))
+        elif w[i] <= tol:
+            viol = max(viol, max(0.0, -(g[i] + nu)))
+        else:
+            viol = max(viol, max(0.0, g[i] + nu))
+    return {"weights": w, "iterations": it, "kkt_max_violation": viol}
+
+
+def _black_litterman_optimizer(args: dict) -> Dict[str, Any]:
+    """Black-Litterman (1992) / He-Litterman (1999) posterior and allocations."""
+    names = args.get("assets")
+    if not isinstance(names, list) or not 1 <= len(names) <= 60 or len({str(a) for a in names}) != len(names):
+        raise ToolInputError("'assets' must be a list of 1-60 distinct asset names")
+    names = [str(a) for a in names]
+    n = len(names)
+    pos = {a: i for i, a in enumerate(names)}
+
+    def vec(key: str, required: bool = True) -> Optional[List[float]]:
+        raw = args.get(key)
+        if raw is None:
+            if required:
+                raise ToolInputError(f"'{key}' is required")
+            return None
+        if not isinstance(raw, list) or len(raw) != n:
+            raise ToolInputError(f"'{key}' must be a list of {n} numbers (one per asset)")
+        return [_num({"v": v}, "v") for v in raw]
+
+    if args.get("covariance") is not None:
+        Sig = [[float(v) for v in row] for row in _matrix(args.get("covariance"), "covariance", 60)]
+        if len(Sig) != n or len(Sig[0]) != n:
+            raise ToolInputError(f"'covariance' must be {n}x{n}")
+    else:
+        vols = vec("volatilities")
+        corr = [[float(v) for v in row] for row in _matrix(args.get("correlation"), "correlation", 60)]
+        if len(corr) != n or len(corr[0]) != n:
+            raise ToolInputError(f"'correlation' must be {n}x{n}")
+        if any(v <= 0 for v in vols) or any(abs(corr[i][i] - 1) > 1e-9 for i in range(n)) or \
+                any(abs(c) > 1 + 1e-12 for row in corr for c in row):
+            raise ToolInputError("volatilities must be > 0 and correlation a valid correlation matrix")
+        Sig = [[corr[i][j] * vols[i] * vols[j] for j in range(n)] for i in range(n)]
+    for i in range(n):
+        for j in range(i):
+            if abs(Sig[i][j] - Sig[j][i]) > 1e-10 * max(1.0, abs(Sig[i][j])):
+                raise ToolInputError("covariance must be symmetric")
+            Sig[j][i] = Sig[i][j]
+    Lsig = _chol(Sig, "covariance")
+
+    w_mkt = vec("market_weights")
+    warnings: List[str] = []
+    if any(v < 0 for v in w_mkt):  # type: ignore[union-attr]
+        warnings.append("negative market weights: equilibrium interpretation is unusual")
+    tot = math.fsum(w_mkt)  # type: ignore[arg-type]
+    if tot <= 0:
+        raise ToolInputError("market_weights must sum to a positive number")
+    if abs(tot - 1) > 1e-9:
+        w_mkt = [v / tot for v in w_mkt]  # type: ignore[union-attr]
+        warnings.append(f"market_weights summed to {tot:.6g}; normalised to 1")
+    tau = _num(args, "tau", 0.05, lo=0, lo_inclusive=False, hi=10)
+    mkt_var = _quad(w_mkt, Sig)  # type: ignore[arg-type]
+    if args.get("market_excess_return") is not None:
+        if args.get("risk_aversion") is not None:
+            raise ToolInputError("pass either 'risk_aversion' or 'market_excess_return', not both")
+        er = _num(args, "market_excess_return", lo=-1, hi=5)
+        delta = er / mkt_var
+        if delta <= 0:
+            raise ToolInputError("implied risk aversion delta = market_excess_return / market variance must be > 0")
+    else:
+        delta = _num(args, "risk_aversion", 2.5, lo=0, lo_inclusive=False, hi=1000)
+    rf = _num(args, "risk_free_rate", 0.0, lo=-1, hi=5)
+    ub = _num(args, "max_weight", 1.0, lo=0, lo_inclusive=False, hi=1)
+    if ub * n < 1 - 1e-12:
+        raise ToolInputError(f"max_weight={ub} is infeasible for {n} assets (need max_weight * n >= 1)")
+    use_post = _bool(args, "use_posterior_covariance", True)
+
+    pi = [delta * v for v in _matvec(Sig, w_mkt)]  # type: ignore[arg-type]
+
+    raw_views = args.get("views") or []
+    if not isinstance(raw_views, list) or len(raw_views) > min(30, n * 4):
+        raise ToolInputError("'views' must be a list of at most 30 view objects")
+    P: List[List[float]] = []
+    Q: List[float] = []
+    omega: List[float] = []
+    labels: List[str] = []
+    conf_in: List[Optional[float]] = []
+    tS = [[tau * v for v in row] for row in Sig]
+    for k, vw in enumerate(raw_views):
+        if not isinstance(vw, dict):
+            raise ToolInputError(f"views[{k}] must be an object")
+        row = [0.0] * n
+        if "asset" in vw:
+            if str(vw["asset"]) not in pos:
+                raise ToolInputError(f"views[{k}]: unknown asset {vw['asset']!r}")
+            row[pos[str(vw["asset"])]] = 1.0
+        elif isinstance(vw.get("assets"), dict) and vw["assets"]:
+            for a, wt in vw["assets"].items():
+                if str(a) not in pos:
+                    raise ToolInputError(f"views[{k}]: unknown asset {a!r}")
+                row[pos[str(a)]] += _num({"w": wt}, "w")
+        else:
+            raise ToolInputError(f"views[{k}] needs 'asset' (absolute view) or 'assets' {{name: weight}} "
+                                 "(relative view, e.g. {'A': 1, 'B': -1})")
+        if all(v == 0 for v in row):
+            raise ToolInputError(f"views[{k}]: view portfolio is all zeros")
+        qk = _num(vw, "return", required=True, lo=-5, hi=5)
+        pv = _quad(row, tS)
+        if vw.get("omega") is not None:
+            om = _num(vw, "omega", lo=0)
+            conf_in.append(None)
+        else:
+            c = _num(vw, "confidence", 0.5, lo=0, lo_inclusive=False, hi=1)
+            om = (1 - c) / c * pv
+            conf_in.append(c)
+        P.append(row)
+        Q.append(qk)
+        omega.append(om)
+        labels.append(str(vw.get("label") or " ".join(f"{'+' if v > 0 else '-'}{abs(v):g}*{names[i]}"
+                                                      for i, v in enumerate(row) if v)))
+
+    k = len(P)
+    tSPt: List[List[float]] = []
+    if k:
+        tSPt = [_matvec(tS, p) for p in P]  # columns of tau*Sigma*P^T (k vectors of length n)
+        A = [[_dot(P[i], tSPt[j]) + (omega[i] if i == j else 0.0) for j in range(k)] for i in range(k)]
+        try:
+            LA = _chol(A, "P tau Sigma P' + Omega")
+        except ToolInputError:
+            raise ToolInputError("views are linearly dependent (P must have full row rank when confidence = 1)")
+        d = [qk - _dot(p, pi) for p, qk in zip(P, Q)]
+        u = _chol_solve(LA, d)
+        mu = [pi[i] + math.fsum(tSPt[j][i] * u[j] for j in range(k)) for i in range(n)]
+        # M = tau Sigma - tau Sigma P' A^{-1} P tau Sigma
+        Ainv = [_chol_solve(LA, [1.0 if i == j else 0.0 for i in range(k)]) for j in range(k)]  # symmetric
+        Bm = [[math.fsum(Ainv[a][b] * tSPt[b][j] for b in range(k)) for j in range(n)] for a in range(k)]
+        M = [[tS[i][j] - math.fsum(tSPt[a][i] * Bm[a][j] for a in range(k)) for j in range(n)] for i in range(n)]
+    else:
+        u, mu = [], pi[:]
+        M = [row[:] for row in tS]
+    Sig_post = [[Sig[i][j] + M[i][j] for j in range(n)] for i in range(n)]
+    for i in range(n):  # symmetrise round-off
+        for j in range(i):
+            Sig_post[i][j] = Sig_post[j][i] = 0.5 * (Sig_post[i][j] + Sig_post[j][i])
+    Lpost = _chol(Sig_post, "posterior covariance")
+
+    w_prior = [v / delta for v in _chol_solve(Lsig, mu)]
+    w_hl = [v / delta for v in _chol_solve(Lpost, mu)]
+    C = Sig_post if use_post else Sig
+    LC = Lpost if use_post else Lsig
+    a1 = _chol_solve(LC, mu)
+    a2 = _chol_solve(LC, [1.0] * n)
+    eta_b = (math.fsum(a1) - delta) / math.fsum(a2)
+    w_budget = [(x - eta_b * y) / delta for x, y in zip(a1, a2)]
+    lo_qp = _long_only_qp(mu, C, delta, ub)
+
+    def stats(w: List[float]) -> Dict[str, Any]:
+        er = _dot(w, mu)
+        vol = math.sqrt(max(_quad(w, Sig_post), 0.0))
+        return {"weights": {a: x for a, x in zip(names, w)}, "sum_of_weights": math.fsum(w),
+                "expected_excess_return": er, "volatility": vol, "sharpe": er / vol if vol > 0 else None}
+
+    out: Dict[str, Any] = {
+        "model": "Black-Litterman: prior N(pi, tau*Sigma) with pi = delta*Sigma*w_mkt (reverse optimisation); "
+                 "views P mu = q + e, e ~ N(0, Omega); Gaussian posterior (He-Litterman 1999)",
+        "inputs": {"assets": names, "tau": tau, "risk_aversion": delta, "risk_free_rate": rf, "views": k,
+                   "max_weight": ub},
+        "market": {"weights": {a: x for a, x in zip(names, w_mkt)}, "volatility": math.sqrt(mkt_var),  # type: ignore[arg-type]
+                   "implied_excess_return": _dot(w_mkt, pi)},  # type: ignore[arg-type]
+        "equilibrium_excess_returns": {a: x for a, x in zip(names, pi)},
+        "posterior_excess_returns": {a: x for a, x in zip(names, mu)},
+        "posterior_total_returns": {a: x + rf for a, x in zip(names, mu)},
+        "posterior_volatility": {a: math.sqrt(Sig_post[i][i]) for i, a in enumerate(names)},
+        "return_shift_vs_equilibrium": {a: m - p for a, m, p in zip(names, mu, pi)},
+        "portfolios": {
+            "unconstrained_prior_cov": {**stats(w_prior), "formula": "(delta Sigma)^-1 mu_BL = w_mkt + P' Lambda"},
+            "unconstrained_posterior_cov": {**stats(w_hl), "formula": "(delta Sigma_post)^-1 mu_BL (He-Litterman)"},
+            "fully_invested": {**stats(w_budget), "constraint": "sum w = 1, shorts allowed"},
+            "long_only": {**stats(lo_qp["weights"]), "constraint": f"sum w = 1, 0 <= w <= {ub:g}",
+                          "solver": {"method": "FISTA projected gradient + exact active-set polish",
+                                     "iterations": lo_qp["iterations"],
+                                     "kkt_max_violation": lo_qp["kkt_max_violation"]}},
+        },
+        "optimisation_covariance": "posterior (Sigma + M)" if use_post else "prior (Sigma)",
+    }
+    if k:
+        lam_tilt = [tau / delta * v for v in u]
+        diag = []
+        for j in range(k):
+            prior_v, post_v = _dot(P[j], pi), _dot(P[j], mu)
+            gap = Q[j] - prior_v
+            diag.append({"view": labels[j], "q": Q[j], "omega": omega[j], "confidence": conf_in[j],
+                         "equilibrium_implied": prior_v, "posterior": post_v,
+                         "fraction_of_gap_closed": (post_v - prior_v) / gap if abs(gap) > 1e-15 else None,
+                         "tilt_lambda": lam_tilt[j]})
+        out["views"] = diag
+        out["view_mapping"] = ("omega_k = (1 - c)/c * tau * p_k Sigma p_k' (c = confidence; c = 1 -> exact view, "
+                               "c = 0.5 -> He-Litterman omega = tau p Sigma p'); explicit 'omega' overrides")
+    out["formulas"] = {
+        "posterior_mean": "mu_BL = pi + tau Sigma P' (P tau Sigma P' + Omega)^-1 (q - P pi)",
+        "posterior_cov": "Sigma_post = Sigma + tau Sigma - tau Sigma P' (P tau Sigma P' + Omega)^-1 P tau Sigma",
+    }
+    if warnings:
+        out["warnings"] = warnings
+    return out
+
+
+BLACK_LITTERMAN_SCHEMA = {
+    "name": "black_litterman_optimizer",
+    "description": (
+        "Black-Litterman allocation: reverse-optimise equilibrium excess returns pi = delta*Sigma*w_mkt, blend "
+        "with absolute/relative investor views (confidence or explicit omega) by Bayesian updating, and return "
+        "posterior expected returns and covariance, per-view diagnostics (how far the posterior moved toward each "
+        "view), and four portfolios: unconstrained (prior and posterior covariance), fully invested, and "
+        "long-only with an optional max weight (exact KKT-checked QP). Returns are annualised excess returns."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "assets": {"type": "array", "items": {"type": "string"}, "description": "Asset names (1-60)."},
+            "covariance": {"type": "array", "items": {"type": "array", "items": {"type": "number"}},
+                           "description": "Annualised covariance matrix (n x n). Or give volatilities + correlation."},
+            "volatilities": {"type": "array", "items": {"type": "number"}, "description": "Annualised vols (decimals), with correlation."},
+            "correlation": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}, "description": "Correlation matrix (n x n)."},
+            "market_weights": {"type": "array", "items": {"type": "number"}, "description": "Market-cap weights (normalised if they don't sum to 1)."},
+            "risk_aversion": {"type": "number", "description": "delta (default 2.5)."},
+            "market_excess_return": {"type": "number", "description": "Alternative to risk_aversion: delta = this / market variance."},
+            "tau": {"type": "number", "description": "Prior uncertainty scale (default 0.05)."},
+            "views": {"type": "array", "items": {"type": "object"},
+                      "description": "Views: {asset: 'A', return: 0.07, confidence: 0.6} or {assets: {'A': 1, 'B': -1}, "
+                                     "return: 0.02, confidence: 0.5} or with 'omega' (view variance) instead of confidence; optional 'label'."},
+            "risk_free_rate": {"type": "number", "description": "Added to report total returns (default 0)."},
+            "max_weight": {"type": "number", "description": "Long-only cap per asset in (0, 1] (default 1)."},
+            "use_posterior_covariance": {"type": "boolean", "description": "Optimise with Sigma_post (default true) or Sigma."},
+        },
+        "required": ["assets", "market_weights"],
+    },
+}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 14. Jane Street style EV trainer (generate -> check -> solve)
+# ════════════════════════════════════════════════════════════════════════
+
+_TR_CODES = {"conditional_expectation": "CE", "dice_stopping": "DS", "card_stopping": "CS", "auction": "AU"}
+_TR_FROM_CODE = {v: k for k, v in _TR_CODES.items()}
+_TR_ID_RE = re.compile(r"^JSQR-(CE|DS|CS|AU)-([a-z_]+)-([123])-(\d{1,12})$")
+
+
+def _fr(x: Any) -> str:
+    x = Fraction(x)
+    return str(x.numerator) if x.denominator == 1 else f"{x} (≈ {float(x):.4f})"
+
+
+def _money(x: Any) -> str:
+    return f"${float(x):,.2f}"
+
+
+def _dist_add(d: Dict[Fraction, Fraction], x: Any, p: Fraction) -> None:
+    x = Fraction(x)
+    d[x] = d.get(x, Fraction(0)) + p
+
+
+def _tr_price(rng: random.Random, fair: Fraction, dist: Dict[Fraction, Fraction]) -> Fraction:
+    sd = math.sqrt(float(sum(p * (x - fair) ** 2 for x, p in dist.items())))
+    step = Fraction(1, 4) if sd < 3 else (Fraction(1) if sd < 30 else Fraction(5))
+    base = Fraction(round(fair / step)) * step
+    price = base + step * rng.choice([-3, -2, -1, -1, 0, 1, 1, 2, 3])
+    lo = min(dist)
+    if price <= lo:
+        price = lo + step
+    return price
+
+
+def _moments(dist: Dict[Fraction, Fraction]) -> Tuple[Fraction, Fraction]:
+    m = sum(p * x for x, p in dist.items())
+    return m, sum(p * (x - m) ** 2 for x, p in dist.items())
+
+
+def _hedge_overlay(rng, outcomes, Y, H, desc: str) -> Optional[Dict[str, Any]]:
+    """Variance-minimising hedge of payoff Y with instrument H (both functions of the outcome)."""
+    m = len(outcomes)
+    p = Fraction(1, m)
+    ey = sum(Y(o) for o in outcomes) * p
+    eh = sum(H(o) for o in outcomes) * p
+    vy = sum((Y(o) - ey) ** 2 for o in outcomes) * p
+    vh = sum((H(o) - eh) ** 2 for o in outcomes) * p
+    if vh == 0 or vy == 0:
+        return None
+    cov = sum((Y(o) - ey) * (H(o) - eh) for o in outcomes) * p
+    beta = cov / vh
+    resid = vy - beta * beta * vh
+    if beta <= 0 or resid > Fraction(9, 10) * vy:
+        return None
+    cap = Fraction(math.floor(float(resid + vy)), 2)  # midpoint, rounded down to 0.5
+    if not resid < cap < vy:
+        return None
+    return {"instrument": desc, "fair_price": eh, "ratio": beta, "var_before": vy, "var_after": resid,
+            "cap": cap, "cov": cov, "var_hedge": vh}
+
+
+def _tr_ce_dice(rng: random.Random, diff: int) -> Dict[str, Any]:
+    n = 6 if diff == 1 else rng.choice([6, 8])
+    k = 2 if diff < 3 else rng.choice([2, 3])
+    pays = [("the sum of the dice", sum), ("the highest die", max)]
+    if diff >= 2:
+        pays += [("the product of the dice", math.prod), ("the lowest die", min)]
+        if k == 2:
+            pays.append(("the absolute difference of the two dice", lambda o: abs(o[0] - o[1])))
+    space = list(itertools.product(range(1, n + 1), repeat=k))
+    while True:
+        m_ = rng.randint(1, n)
+        s_ = rng.randint(k + 1, k * n - 1)
+        conds = [(f"at least one die shows a {m_}", lambda o, m_=m_: m_ in o),
+                 (f"the sum of the dice is at least {s_}", lambda o, s_=s_: sum(o) >= s_),
+                 (f"the highest die is exactly {max(m_, 2)}", lambda o, m_=max(m_, 2): max(o) == m_)]
+        if diff >= 2:
+            conds += [("all dice show different values", lambda o: len(set(o)) == k),
+                      ("the first die is strictly smaller than the last die", lambda o: o[0] < o[-1])]
+        cdesc, cond = rng.choice(conds)
+        omega = [o for o in space if cond(o)]
+        if 0 < len(omega) < len(space):
+            break
+    pdesc, pay = rng.choice(pays)
+    p = Fraction(1, len(omega))
+    dist: Dict[Fraction, Fraction] = {}
+    for o in omega:
+        _dist_add(dist, pay(o), p)
+    fair, _ = _moments(dist)
+    price = _tr_price(rng, fair, dist)
+    hedge = None
+    if diff >= 2 and fair > price and rng.random() < 0.6:
+        hedge = _hedge_overlay(rng, omega, lambda o: Fraction(pay(o)), lambda o: Fraction(o[0]),
+                               "units of the 'first die' contract (pays the first die's value, traded at its "
+                               "fair conditional value)")
+    total = sum(Fraction(pay(o)) for o in omega)
+    return {
+        "title": f"Conditional dice: {pdesc}",
+        "prompt": (f"{k} fair {n}-sided dice are rolled behind a screen. You are told that {cdesc}. "
+                   f"You may pay {_money(price)} per contract to receive {pdesc}, in dollars."),
+        "dist": dist, "price": price,
+        "proof": {
+            "state_space": f"Omega = {{1..{n}}}^{k}, uniform prior over {n ** k} outcomes; information set: "
+                           f"'{cdesc}' leaves {len(omega)} equally likely outcomes.",
+            "transitions": f"One period. Bayes on a uniform prior: P(omega | info) = 1/{len(omega)} for every "
+                           "consistent outcome, 0 otherwise.",
+            "terminal_payoffs": f"Y(omega) = {pdesc}, ranging {_fr(min(dist))}..{_fr(max(dist))}; net = Y - {_fr(price)}.",
+            "ev": f"E[Y | info] = (sum of Y over consistent outcomes)/{len(omega)} = {total}/{len(omega)} = "
+                  f"{_fr(fair)}; EV = {_fr(fair)} - {_fr(price)} = {_fr(fair - price)}.",
+        },
+        "hedge": hedge,
+    }
+
+
+def _tr_ce_coins(rng: random.Random, diff: int) -> Dict[str, Any]:
+    n = {1: rng.choice([3, 4]), 2: rng.choice([5, 6]), 3: rng.choice([7, 8])}[diff]
+    space = list(itertools.product((0, 1), repeat=n))
+
+    def longest(o):
+        best = cur = 0
+        for v in o:
+            cur = cur + 1 if v else 0
+            best = max(best, cur)
+        return best
+
+    pays = [("the number of heads", sum)]
+    if diff >= 2:
+        pays.append(("the square of the number of heads", lambda o: sum(o) ** 2))
+    if diff >= 3:
+        pays.append(("the length of the longest run of heads", longest))
+    while True:
+        kk = rng.randint(1, n - 1)
+        conds = [(f"there are at least {kk} heads", lambda o, kk=kk: sum(o) >= kk),
+                 ("the first flip was heads", lambda o: o[0] == 1)]
+        if diff >= 3:
+            conds.append(("no two consecutive flips were both tails",
+                          lambda o: all(o[i] or o[i + 1] for i in range(n - 1))))
+        cdesc, cond = rng.choice(conds)
+        omega = [o for o in space if cond(o)]
+        if 0 < len(omega) < len(space):
+            break
+    pdesc, pay = rng.choice(pays)
+    p = Fraction(1, len(omega))
+    dist: Dict[Fraction, Fraction] = {}
+    for o in omega:
+        _dist_add(dist, pay(o), p)
+    fair, _ = _moments(dist)
+    price = _tr_price(rng, fair, dist)
+    h = n // 2
+    hedge = None
+    if diff >= 2 and fair > price and rng.random() < 0.6:
+        hedge = _hedge_overlay(rng, omega, lambda o: Fraction(pay(o)), lambda o: Fraction(sum(o[:h])),
+                               f"units of the 'early heads' contract (pays the number of heads in the first {h} "
+                               "flips, traded at its fair conditional value)")
+    return {
+        "title": f"Conditional coins: {pdesc}",
+        "prompt": (f"A fair coin is flipped {n} times out of sight. You are told that {cdesc}. You may pay "
+                   f"{_money(price)} per contract to receive {pdesc}, in dollars."),
+        "dist": dist, "price": price,
+        "proof": {
+            "state_space": f"Omega = {{H,T}}^{n} ({2 ** n} equally likely sequences); conditioning on '{cdesc}' "
+                           f"leaves {len(omega)} sequences.",
+            "transitions": f"One period; P(sequence | info) = 1/{len(omega)} on the consistent set (uniform prior).",
+            "terminal_payoffs": f"Y = {pdesc}; net = Y - {_fr(price)}. Conditional law: "
+                                + ", ".join(f"P(Y={_fr(x)})={pp}" for x, pp in sorted(dist.items())) + ".",
+            "ev": f"E[Y | info] = sum_y y P(Y=y | info) = {_fr(fair)}; EV = {_fr(fair)} - {_fr(price)} = "
+                  f"{_fr(fair - price)}.",
+        },
+        "hedge": hedge,
+    }
+
+
+_CARD_ATTRS = {
+    "ace": ("an ace", lambda r, s: r == 1),
+    "heart": ("a heart", lambda r, s: s == 0),
+    "red": ("a red card", lambda r, s: s in (0, 1)),
+    "face": ("a face card (J, Q, K)", lambda r, s: r >= 11),
+}
+
+
+def _tr_ce_cards(rng: random.Random, diff: int) -> Dict[str, Any]:
+    d = 2 if diff < 3 else 3
+    a1, a2 = rng.choice(list(_CARD_ATTRS)), rng.choice(list(_CARD_ATTRS))
+    mult = rng.choice([1, 2, 5, 10])
+    f1, f2 = _CARD_ATTRS[a1][1], _CARD_ATTRS[a2][1]
+    counts: Dict[Tuple[bool, bool], int] = {}
+    for r_ in range(1, 14):
+        for s_ in range(4):
+            key = (f1(r_, s_), f2(r_, s_))
+            counts[key] = counts.get(key, 0) + 1
+    types = list(counts)
+    total = math.comb(52, d)
+    joint: Dict[Tuple[int, int], Fraction] = {}
+    for comp in itertools.product(range(d + 1), repeat=len(types)):
+        if sum(comp) != d:
+            continue
+        ways = math.prod(math.comb(counts[t], c) for t, c in zip(types, comp))
+        if ways:
+            c1 = sum(c for t, c in zip(types, comp) if t[0])
+            c2 = sum(c for t, c in zip(types, comp) if t[1])
+            joint[(c1, c2)] = joint.get((c1, c2), Fraction(0)) + Fraction(ways, total)
+    p_cond = sum(p for (c1, _), p in joint.items() if c1 >= 1)
+    dist: Dict[Fraction, Fraction] = {}
+    for (c1, c2), p in joint.items():
+        if c1 >= 1:
+            _dist_add(dist, mult * c2, p / p_cond)
+    fair, _ = _moments(dist)
+    price = _tr_price(rng, fair, dist)
+    n1, n2 = _CARD_ATTRS[a1][0], _CARD_ATTRS[a2][0]
+    return {
+        "title": f"Conditional cards: {a2} count given {a1}",
+        "prompt": (f"{d} cards are dealt face down from a well-shuffled 52-card deck. You are told that at least one "
+                   f"of them is {n1}. You may pay {_money(price)} to receive ${mult} for every card among the {d} "
+                   f"that is {n2}."),
+        "dist": dist, "price": price,
+        "proof": {
+            "state_space": f"Unordered {d}-card hands, C(52,{d}) = {total} equally likely; classify cards by "
+                           f"(is {a1}, is {a2}) - counts {dict((str(k), v) for k, v in counts.items())}.",
+            "transitions": f"Multivariate hypergeometric over the four card types; condition on N_{a1} >= 1, "
+                           f"P(N_{a1} >= 1) = {_fr(p_cond)} (= 1 - P(no {a1})).",
+            "terminal_payoffs": f"Y = {mult} * N_{a2}; net = Y - {_fr(price)}. Conditional law: "
+                                + ", ".join(f"P(Y={_fr(x)})={_fr(pp)}" for x, pp in sorted(dist.items())) + ".",
+            "ev": f"E[Y | N_{a1} >= 1] = sum_y y P(Y=y, N_{a1}>=1) / P(N_{a1}>=1) = {_fr(fair)}; "
+                  f"EV = {_fr(fair)} - {_fr(price)} = {_fr(fair - price)}.",
+        },
+        "hedge": None,
+    }
+
+
+def _tr_ds_reroll(rng: random.Random, diff: int) -> Dict[str, Any]:
+    n = {1: 6, 2: rng.choice([6, 8]), 3: rng.choice([6, 8, 10, 12])}[diff]
+    k = {1: 2, 2: rng.choice([2, 3]), 3: rng.choice([3, 4, 5])}[diff]
+    square = diff == 3 and rng.random() < 0.5
+    c = Fraction(0) if diff == 1 else rng.choice([Fraction(0), Fraction(1, 2), Fraction(1)])
+    g = (lambda f: Fraction(f * f)) if square else (lambda f: Fraction(f))
+    faces = range(1, n + 1)
+    V = [Fraction(0), sum(g(f) for f in faces) / n]  # V[j]: value with j rolls left (first roll free)
+    for j in range(2, k + 1):
+        V.append(sum(max(g(f), V[j - 1] - c) for f in faces) / n)
+    dist: Dict[Fraction, Fraction] = {}
+    mass = Fraction(1)
+    thresholds = []
+    for i in range(1, k + 1):  # roll i, with j = k - i + 1 rolls left including this one
+        j = k - i + 1
+        cont = V[j - 1] - c if j >= 2 else None
+        if cont is not None:
+            thr = next((f for f in faces if g(f) >= cont), None)
+            thresholds.append(f"roll {i}: keep iff payoff >= {_fr(cont)} (face >= {thr})")
+        nxt = Fraction(0)
+        for f in faces:
+            if cont is None or g(f) >= cont:
+                _dist_add(dist, g(f) - c * (i - 1), mass / n)
+            else:
+                nxt += mass / n
+        mass = nxt
+    price = _tr_price(rng, V[k], dist)
+    pay_txt = "the square of the face shown" if square else "the face value shown"
+    cost_txt = f" Each re-roll costs {_money(c)}." if c else ""
+    return {
+        "title": f"Re-roll game: {k} rolls of a d{n}",
+        "prompt": (f"You pay {_money(price)} to play. You roll a fair {n}-sided die; after seeing it you may stop and "
+                   f"collect {pay_txt} in dollars, or roll again, up to {k} rolls in total (the last roll must be "
+                   f"kept).{cost_txt}"),
+        "dist": dist, "price": price,
+        "proof": {
+            "state_space": f"State = (rolls remaining j, current face f); control: stop or re-roll.",
+            "transitions": f"Each roll is uniform on 1..{n}, independent of the past.",
+            "terminal_payoffs": f"Stopping at roll i on face f pays {'f^2' if square else 'f'}"
+                                + (f" - {_fr(c)}*(i-1)" if c else "") + f"; net of the {_fr(price)} entry price.",
+            "ev": "Backward induction: V_1 = E[g(F)], V_j = E[max(g(F), V_{j-1} - c)] -> "
+                  + ", ".join(f"V_{j} = {_fr(V[j])}" for j in range(1, k + 1))
+                  + f". Policy: " + "; ".join(thresholds) + f". EV = {_fr(V[k])} - {_fr(price)} = {_fr(V[k] - price)}.",
+        },
+        "hedge": None,
+    }
+
+
+def _tr_ds_pig(rng: random.Random, diff: int) -> Dict[str, Any]:
+    n = 6 if diff == 2 else rng.choice([6, 8])
+    T = n * (n + 1) // 2 - 1  # one-step-lookahead threshold (monotone problem)
+    V: Dict[int, Fraction] = {s: Fraction(s) for s in range(T, T + n)}
+    for s in range(T - 1, -1, -1):
+        V[s] = sum(V[s + f] for f in range(2, n + 1)) / n
+    dist: Dict[Fraction, Fraction] = {}
+    mass: Dict[int, Fraction] = {0: Fraction(1)}
+    for s in range(0, T):
+        p = mass.pop(s, Fraction(0))
+        if not p:
+            continue
+        _dist_add(dist, 0, p / n)
+        for f in range(2, n + 1):
+            mass[s + f] = mass.get(s + f, Fraction(0)) + p / n
+    for s, p in mass.items():
+        _dist_add(dist, s, p)
+    price = _tr_price(rng, V[0], dist)
+    return {
+        "title": f"Pig (d{n}): when to bank",
+        "prompt": (f"You pay {_money(price)} to play. You repeatedly roll a fair {n}-sided die, adding each face to a "
+                   f"running total. If you ever roll a 1 the game ends and you get $0. You may stop before any roll "
+                   f"and collect the running total in dollars."),
+        "dist": dist, "price": price,
+        "proof": {
+            "state_space": "State = running total s (>= 0) or 'bust'; control: bank or roll.",
+            "transitions": f"From s: with prob 1/{n} -> bust (payoff 0); with prob 1/{n} each -> s+f for f = 2..{n}.",
+            "terminal_payoffs": f"Bank at s -> s; bust -> 0; net of the {_fr(price)} entry price.",
+            "ev": f"One-step lookahead: rolling gains (1/{n})*sum_{{f=2..{n}}} f - s/{n} >= 0 iff s <= {T}; the stopping "
+                  f"set {{s >= {T}}} is closed (totals only rise or bust), so OLA is optimal: bank iff s >= {T}. "
+                  f"V(s) = s for s >= {T}, V(s) = (1/{n}) sum_{{f=2..{n}}} V(s+f) below; V(0) = {_fr(V[0])}. "
+                  f"EV = {_fr(V[0])} - {_fr(price)} = {_fr(V[0] - price)}.",
+        },
+        "hedge": None,
+    }
+
+
+def _tr_cs_red_black(rng: random.Random, diff: int) -> Dict[str, Any]:
+    lo_hi = {1: (2, 4), 2: (3, 6), 3: (5, 9)}[diff]
+    R, B = rng.randint(*lo_hi), rng.randint(*lo_hi)
+    a = 1 if diff == 1 else rng.choice([1, 2])
+    b = 1 if diff == 1 else rng.choice([1, 2])
+    V: Dict[Tuple[int, int], Fraction] = {}
+    for r_ in range(R + 1):
+        for b_ in range(B + 1):
+            if r_ == 0:
+                V[(r_, b_)] = Fraction(0)
+            elif b_ == 0:
+                V[(r_, b_)] = Fraction(a * r_)
+            else:
+                cont = Fraction(r_, r_ + b_) * (a + V[(r_ - 1, b_)]) + Fraction(b_, r_ + b_) * (-b + V[(r_, b_ - 1)])
+                V[(r_, b_)] = max(Fraction(0), cont)
+    dist: Dict[Fraction, Fraction] = {}
+    mass = {(R, B): Fraction(1)}
+    for left in range(R + B, -1, -1):
+        for (r_, b_) in [s for s in list(mass) if s[0] + s[1] == left]:
+            p = mass.pop((r_, b_))
+            gained = a * (R - r_) - b * (B - b_)
+            if r_ + b_ == 0 or V[(r_, b_)] == 0:
+                _dist_add(dist, gained, p)
+                continue
+            if r_:
+                mass[(r_ - 1, b_)] = mass.get((r_ - 1, b_), Fraction(0)) + p * Fraction(r_, r_ + b_)
+            if b_:
+                mass[(r_, b_ - 1)] = mass.get((r_, b_ - 1), Fraction(0)) + p * Fraction(b_, r_ + b_)
+    price = _tr_price(rng, V[(R, B)], dist)
+    return {
+        "title": f"Red/black deck ({R}R/{B}B)",
+        "prompt": (f"You pay {_money(price)} to play. A deck of {R} red and {B} black cards is shuffled. Cards are "
+                   f"turned one at a time; each red pays you ${a}, each black costs you ${b}. You may stop at any "
+                   f"time (including before the first card) and keep your running total."),
+        "dist": dist, "price": price,
+        "proof": {
+            "state_space": "State = (red left r, black left b); running P&L is a(R-r) - b(B-b); control: draw or stop.",
+            "transitions": "Without replacement: next card red w.p. r/(r+b), black w.p. b/(r+b).",
+            "terminal_payoffs": f"Stopping pays the running total; net of the {_fr(price)} entry price.",
+            "ev": f"Dynamic programming: V(r,0) = {a}r, V(0,b) = 0, V(r,b) = max(0, r/(r+b)({a} + V(r-1,b)) + "
+                  f"b/(r+b)(-{b} + V(r,b-1))) -> V({R},{B}) = {_fr(V[(R, B)])}. "
+                  f"EV = {_fr(V[(R, B)])} - {_fr(price)} = {_fr(V[(R, B)] - price)}.",
+        },
+        "hedge": None,
+    }
+
+
+def _tr_cs_next_red(rng: random.Random, diff: int) -> Dict[str, Any]:
+    R, B = rng.randint(3, 13), rng.randint(3, 13)
+    W = rng.choice([10, 20, 50, 100])
+    fair = Fraction(W * R, R + B)
+    dist = {Fraction(W): Fraction(R, R + B), Fraction(0): Fraction(B, R + B)}
+    price = _tr_price(rng, fair, dist)
+    return {
+        "title": "Call the next red card",
+        "prompt": (f"You pay {_money(price)} to play. A deck of {R} red and {B} black cards is turned over one card at "
+                   f"a time. Before any card is turned you may say 'now' (you must do so before the last card); you "
+                   f"win ${W} if the card turned right after you say 'now' is red. You may use everything you have "
+                   f"seen to decide when to call."),
+        "dist": dist, "price": price,
+        "proof": {
+            "state_space": "State = (red left r, black left b); control: call 'now' or wait.",
+            "transitions": "Without replacement; X_t = r_t/(r_t + b_t) (fraction of reds left) is a martingale.",
+            "terminal_payoffs": f"Calling at state (r,b) wins ${W} w.p. r/(r+b); net of the {_fr(price)} entry price.",
+            "ev": f"P(win | stop at tau) = E[X_tau] = X_0 = {R}/{R + B} for every stopping time tau (optional stopping, "
+                  f"bounded tau). No strategy beats calling immediately: E[payoff] = {W}*{R}/{R + B} = {_fr(fair)}. "
+                  f"EV = {_fr(fair)} - {_fr(price)} = {_fr(fair - price)}.",
+        },
+        "hedge": None,
+    }
+
+
+def _tr_au_acquire(rng: random.Random, diff: int) -> Dict[str, Any]:
+    N = {1: 20, 2: 50, 3: 100}[diff]
+    k = rng.choice([Fraction(3, 2), Fraction(9, 5), Fraction(5, 2), Fraction(3)])
+    b0 = rng.randint(N // 4, N)
+    p = Fraction(1, N + 1)
+    dist: Dict[Fraction, Fraction] = {}
+    for v in range(N + 1):
+        _dist_add(dist, k * v - b0 if v <= b0 else 0, p)
+    ev = sum(q * x for x, q in dist.items())
+    evb = [((b + 1) * b * (k / 2 - 1)) / (N + 1) for b in range(N + 1)]
+    bstar = max(range(N + 1), key=lambda b: (evb[b], -b))
+    return {
+        "title": f"Acquiring a company (k = {k})",
+        "prompt": (f"A company is worth V to its owner, where V is uniform on the integers 0..{N} (only the owner knows "
+                   f"V). In your hands it is worth {k}*V. You make one take-it-or-leave-it cash offer b; the owner "
+                   f"accepts iff b >= V. Should you offer b = ${b0}? (Also state the optimal offer.)"),
+        "dist": dist, "price": Fraction(0),
+        "extra": {"optimal_bid": bstar, "ev_at_optimal_bid": evb[bstar]},
+        "proof": {
+            "state_space": f"V ~ U{{0..{N}}} private to the seller; your control is the offer b; the seller's "
+                           "acceptance reveals V <= b (adverse selection).",
+            "transitions": f"Accept iff V <= b: P(accept) = (b+1)/{N + 1}; given acceptance V ~ U{{0..b}}, E[V | accept] = b/2.",
+            "terminal_payoffs": f"Accepted: {k}V - b; rejected: 0.",
+            "ev": f"EV(b) = sum_{{v=0..b}} ({k}v - b)/{N + 1} = (b+1) b ({k}/2 - 1)/{N + 1}. At b = {b0}: EV = {_fr(ev)}. "
+                  f"Since {k}/2 - 1 {'<' if k < 2 else '>'} 0, EV(b) is {'decreasing' if k < 2 else 'increasing'} in b: "
+                  f"optimal offer b* = {bstar} (EV {_fr(evb[bstar])}). Winner's curse: you only win when V is low.",
+        },
+        "hedge": None,
+    }
+
+
+def _tr_au_first_price(rng: random.Random, diff: int) -> Dict[str, Any]:
+    H = {1: 10, 2: 20, 3: 50}[diff]
+    v = rng.randint(H // 2, 2 * H)
+    top = min(v, H + 1)
+
+    def pwin(b: int) -> Fraction:
+        if b > H:
+            return Fraction(1)
+        return (Fraction(b) + Fraction(1, 2)) / (H + 1)
+
+    evs = {b: (v - b) * pwin(b) for b in range(0, top + 1)}
+    bstar = max(evs, key=lambda b: (evs[b], -b))
+    b0 = rng.randint(max(0, v // 4), top)
+    pw = pwin(b0)
+    gross = {Fraction(v - b0): pw, Fraction(0): 1 - pw} if pw < 1 else {Fraction(v - b0): Fraction(1)}
+    gross = {x: q for x, q in gross.items() if q}
+    fair = sum(q * x for x, q in gross.items())
+    fee = _tr_price(rng, fair, gross)
+    if fee < 0:
+        fee = Fraction(0)
+    return {
+        "title": "First-price sealed bid vs a uniform bidder",
+        "prompt": (f"You value an item at ${v}. Your only rival bids an integer uniform on 0..{H} (independent of you). "
+                   f"Highest bid wins and pays its own bid; ties are broken by a fair coin. Entering the auction costs "
+                   f"{_money(fee)}. Should you enter and bid ${b0}? (Also state the optimal integer bid.)"),
+        "dist": gross, "price": fee,
+        "extra": {"optimal_bid": bstar, "ev_at_optimal_bid_before_fee": evs[bstar]},
+        "proof": {
+            "state_space": f"Rival bid X ~ U{{0..{H}}}; your control is bid b in 0..{top}.",
+            "transitions": f"P(win | b) = (#{{x < b}} + 1/2*[b <= {H}])/{H + 1} = (b + 1/2)/{H + 1} for b <= {H}, 1 above.",
+            "terminal_payoffs": f"Win: {v} - b; lose: 0; minus the {_fr(fee)} entry fee in every state.",
+            "ev": f"EV(b) = ({v} - b) P(win | b) - fee. At b = {b0}: ({v} - {b0}) * {_fr(pw)} - {_fr(fee)} = "
+                  f"{_fr(fair - fee)}. Maximising (v - b)(b + 1/2) over integers gives b* = {bstar} "
+                  f"(gross EV {_fr(evs[bstar])}).",
+        },
+        "hedge": None,
+    }
+
+
+_TR_TEMPLATES: Dict[str, List[Tuple[str, int, Callable[[random.Random, int], Dict[str, Any]]]]] = {
+    "conditional_expectation": [("dice", 1, _tr_ce_dice), ("coins", 1, _tr_ce_coins), ("cards", 2, _tr_ce_cards)],
+    "dice_stopping": [("reroll", 1, _tr_ds_reroll), ("pig", 2, _tr_ds_pig)],
+    "card_stopping": [("red_black", 1, _tr_cs_red_black), ("next_red", 1, _tr_cs_next_red)],
+    "auction": [("acquire", 1, _tr_au_acquire), ("first_price", 1, _tr_au_first_price)],
+}
+
+
+def _kelly_units(net: Dict[Fraction, Fraction], bankroll: float) -> Optional[float]:
+    """Growth-optimal number of contracts: argmax_n E[log(B + n X)] (X = net payoff per contract)."""
+    xs = [(float(p), float(x)) for x, p in net.items() if p]
+    worst = min(x for _, x in xs)
+    if worst >= 0:
+        return None  # no losing state: arbitrage, Kelly is unbounded
+    hi = bankroll / -worst
+    lo, hi_ = 0.0, hi * (1 - 1e-12)
+
+    def deriv(n: float) -> float:
+        return math.fsum(p * x / (bankroll + n * x) for p, x in xs)
+
+    if deriv(0.0) <= 0:
+        return 0.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi_)
+        if deriv(mid) > 0:
+            lo = mid
+        else:
+            hi_ = mid
+    return 0.5 * (lo + hi_)
+
+
+def _tr_build(category: str, template: str, diff: int, seed: int) -> Dict[str, Any]:
+    fn = next((f for name, _md, f in _TR_TEMPLATES[category] if name == template), None)
+    if fn is None:
+        raise ToolInputError(f"unknown template {template!r} for {category}")
+    rng = random.Random(f"jsqr|{category}|{template}|{diff}|{seed}")
+    pz = fn(rng, diff)
+    pz["bankroll"] = Fraction(rng.choice({1: [100, 200], 2: [500, 1000], 3: [1000, 5000, 10000]}[diff]))
+    pz["puzzle_id"] = f"JSQR-{_TR_CODES[category]}-{template}-{diff}-{seed}"
+    pz["category"], pz["template"], pz["difficulty"] = category, template, diff
+    return pz
+
+
+def _tr_solution(pz: Dict[str, Any]) -> Dict[str, Any]:
+    dist, price, B = pz["dist"], pz["price"], pz["bankroll"]
+    fair, var = _moments(dist)
+    ev = fair - price
+    net = {x - price: p for x, p in dist.items()}
+    p_loss = sum(p for x, p in net.items() if x < 0)
+    worst = min(net)
+    hedge = pz.get("hedge")
+    size: Any
+    if ev <= 0:
+        tag, size, line = "PASS", 0, "[PASS]"
+        why = "EV <= 0: no edge after the entry price."
+    elif hedge and var > hedge["cap"]:
+        tag, size = "HEDGE", hedge["ratio"]
+        line = f"[HEDGE] sell {_fr(hedge['ratio'])} {hedge['instrument']} per contract"
+        why = (f"EV > 0 but Var(Y) = {_fr(var)} breaches the {_fr(hedge['cap'])} limit. Minimum-variance hedge: "
+               f"beta = Cov(Y,H)/Var(H) = {_fr(hedge['cov'])}/{_fr(hedge['var_hedge'])} = {_fr(hedge['ratio'])}; "
+               f"residual variance {_fr(hedge['var_after'])} <= limit. The hedge trades at fair value, so EV is "
+               f"unchanged.")
+    else:
+        k = _kelly_units(net, float(B))
+        if k is None:
+            tag, size, line = "TAKE", None, "[TAKE] max size allowed by risk limits (no losing state: arbitrage)"
+            why = "EV > 0 and no state loses money: arbitrage."
+        else:
+            tag, size = "TAKE", k / 2
+            line = f"[TAKE] {k / 2:.4g} contracts (half-Kelly on a {_money(B)} bankroll; full Kelly {k:.4g})"
+            why = (f"EV > 0. Size by half-Kelly: n* = argmax E[log(B + n X)] solves sum p_i x_i/(B + n x_i) = 0 -> "
+                   f"n* = {k:.6g}; trade n*/2.")
+    risk = {"variance": var, "std": math.sqrt(float(var)), "p_loss": p_loss, "worst_case": worst,
+            "best_case": max(net)}
+    sol = {
+        "ev": ev, "fair_value": fair, "price": price, "verdict": tag, "verdict_line": line, "size": size,
+        "risk": risk,
+        "proof": {**pz["proof"],
+                  "risk": f"sigma = {math.sqrt(float(var)):.4g}, P(loss) = {_fr(p_loss)}, worst case = {_fr(worst)}",
+                  "verdict": f"{line}. {why}"},
+    }
+    if hedge:
+        sol["hedge"] = {k_: hedge[k_] for k_ in ("instrument", "fair_price", "ratio", "var_before", "var_after", "cap")}
+    if pz.get("extra"):
+        sol["extra"] = pz["extra"]
+    return sol
+
+
+_ANSWER_CONTRACT = (
+    "Answer with: (1) State space, (2) Transition probabilities, (3) Terminal payoffs, (4) EV = <exact fraction> "
+    "with a risk number, (5) exactly one verdict tag. Verdict rule: [PASS] if EV <= 0; [HEDGE] <instrument> <ratio> "
+    "if EV > 0 but a stated variance limit is breached (ratio = variance-minimising hedge ratio); otherwise [TAKE] "
+    "<contracts> sized at half-Kelly on the stated bankroll. Then grade it with jane_street_ev_trainer(action='check', "
+    "puzzle_id=..., verdict='[TAKE] 12.5', ev='17/4', size=12.5, proof='<your derivation>')."
+)
+
+
+def _tr_parse_id(pid: Any) -> Tuple[str, str, int, int]:
+    m = _TR_ID_RE.match(str(pid or "").strip())
+    if not m:
+        raise ToolInputError("invalid puzzle_id (expected JSQR-<CE|DS|CS|AU>-<template>-<1-3>-<seed>, as returned "
+                             "by action='generate')")
+    return _TR_FROM_CODE[m.group(1)], m.group(2), int(m.group(3)), int(m.group(4))
+
+
+def _tr_public(pz: Dict[str, Any]) -> Dict[str, Any]:
+    prompt = pz["prompt"] + f" Bankroll: {_money(pz['bankroll'])}."
+    if pz.get("hedge"):
+        h = pz["hedge"]
+        prompt += (f" Risk limit: payoff variance per contract must not exceed {_fr(h['cap'])}. You may trade "
+                   f"{h['instrument'].replace('units of the ', 'the ')} at {_fr(h['fair_price'])}.")
+    return {"puzzle_id": pz["puzzle_id"], "category": pz["category"], "template": pz["template"],
+            "difficulty": pz["difficulty"], "title": pz["title"], "prompt": prompt}
+
+
+def _jane_street_ev_trainer(args: dict) -> Dict[str, Any]:
+    """Generate, grade and solve desk-style EV puzzles."""
+    action = _choice(args, "action", ("generate", "check", "solve"), "generate")
+    if action == "generate":
+        cat = _choice(args, "category", ("random",) + tuple(_TR_CODES), "random")
+        diff = _int(args, "difficulty", 2, lo=1, hi=3)
+        seed = args.get("seed")
+        seed = random.SystemRandom().randrange(10**9) if seed is None else _int(args, "seed", lo=0, hi=10**12 - 1)
+        pick = random.Random(f"jsqr-pick|{cat}|{diff}|{seed}")
+        if cat == "random":
+            cat = pick.choice(list(_TR_CODES))
+        allowed = [name for name, md, _f in _TR_TEMPLATES[cat] if md <= diff]
+        tmpl = args.get("template")
+        if tmpl is None:
+            tmpl = pick.choice(allowed)
+        elif str(tmpl) not in allowed:
+            raise ToolInputError(f"template must be one of {allowed} for {cat} at difficulty {diff}")
+        pz = _tr_build(cat, str(tmpl), diff, seed)
+        return {"action": "generate", **_tr_public(pz), "answer_contract": _ANSWER_CONTRACT}
+
+    cat, tmpl, diff, seed = _tr_parse_id(args.get("puzzle_id"))
+    if tmpl not in [name for name, md, _f in _TR_TEMPLATES[cat] if md <= diff]:
+        raise ToolInputError("invalid puzzle_id: template not available at that difficulty")
+    pz = _tr_build(cat, tmpl, diff, seed)
+    sol = _tr_solution(pz)
+    public = _tr_public(pz)
+    sol_out = {k: sol[k] for k in ("ev", "fair_value", "price", "verdict", "verdict_line", "size", "risk", "proof")}
+    for k in ("hedge", "extra"):
+        if k in sol:
+            sol_out[k] = sol[k]
+    if action == "solve":
+        return {"action": "solve", **public, "solution": sol_out}
+
+    # ---- check ----
+    vtxt = args.get("verdict")
+    if not isinstance(vtxt, str):
+        raise ToolInputError("'verdict' is required: a string with exactly one of [TAKE] / [PASS] / [HEDGE]")
+    tags = re.findall(r"\[(TAKE|PASS|HEDGE)\]", vtxt)
+    if len(tags) != 1:
+        raise ToolInputError("'verdict' must contain exactly one tag: [TAKE], [PASS] or [HEDGE]")
+    tag = tags[0]
+    ev_sub = args.get("ev")
+    if ev_sub is None:
+        raise ToolInputError("'ev' is required (exact fraction like '17/4' or a decimal)")
+    ev_in = _frac(str(ev_sub).replace("≈", "").replace("$", "").strip() if isinstance(ev_sub, str) else ev_sub, "ev")
+    size_in: Optional[float] = None
+    if args.get("size") is not None:
+        size_in = _num(args, "size")
+    else:
+        mnum = re.search(r"\]\s*[^\d\-]*(-?\d+(?:\.\d+)?(?:/\d+)?)", vtxt)
+        if mnum:
+            size_in = float(Fraction(mnum.group(1)))
+
+    fb: Dict[str, Any] = {}
+    pts_v = 40 if tag == sol["verdict"] else 0
+    fb["verdict"] = {"points": pts_v, "max": 40, "submitted": f"[{tag}]", "correct": f"[{sol['verdict']}]"}
+    ev_true = sol["ev"]
+    if ev_in == ev_true:
+        pts_e, note = 30, "exact"
+    elif abs(float(ev_in - ev_true)) <= max(1e-4, 1e-4 * abs(float(ev_true))):
+        pts_e, note = 27, "correct to rounding (give the exact fraction for full marks)"
+    elif abs(float(ev_in - ev_true)) <= 0.01 * max(abs(float(ev_true)), 1.0):
+        pts_e, note = 15, "within 1%"
+    else:
+        pts_e, note = 0, "wrong"
+    fb["ev"] = {"points": pts_e, "max": 30, "submitted": ev_in, "correct": ev_true, "note": note}
+    true_size = sol["size"]
+    if sol["verdict"] == "PASS":
+        pts_s = 20 if tag == "PASS" and not size_in else (10 if tag == "PASS" else 0)
+        snote = "no position on a non-positive EV"
+    elif true_size is None:
+        pts_s, snote = (20 if tag == "TAKE" else 0), "arbitrage: size limited only by risk limits"
+    elif size_in is None or tag != sol["verdict"]:
+        pts_s, snote = 0, "missing size" if size_in is None else "size scored only with the right verdict"
+    else:
+        tv = float(true_size)
+        rel = abs(abs(size_in) - tv) / max(abs(tv), 1e-12)
+        if sol["verdict"] == "HEDGE":
+            pts_s, snote = (20, "hedge ratio correct") if rel <= 0.01 else (0, "hedge ratio off")
+        elif rel <= 0.10:
+            pts_s, snote = 20, "half-Kelly size within 10%"
+        elif abs(abs(size_in) - 2 * tv) <= 0.10 * 2 * tv:
+            pts_s, snote = 10, "that is full Kelly; desks run half-Kelly"
+        else:
+            pts_s, snote = 0, "size off by more than 10%"
+    fb["size"] = {"points": pts_s, "max": 20, "submitted": size_in, "correct": true_size, "note": snote}
+    proof = args.get("proof") or ""
+    checks = {
+        "state_space": bool(re.search(r"state[\s_-]*space", str(proof), re.I)),
+        "transitions": bool(re.search(r"transition", str(proof), re.I)),
+        "terminal_payoffs": bool(re.search(r"payoff", str(proof), re.I)),
+        "ev_equation": bool(_EV_RE.search(str(proof))),
+        "verdict_tag": bool(_VERDICT_RE.search(str(proof))) or bool(tags),
+    }
+    pts_p = 2 * sum(checks.values())
+    fb["proof_structure"] = {"points": pts_p, "max": 10, "sections_present": checks}
+    score = pts_v + pts_e + pts_s + pts_p
+    return {
+        "action": "check", "puzzle_id": pz["puzzle_id"], "score": score,
+        "grade": "desk-ready" if score >= 90 else ("close" if score >= 70 else "review the solution"),
+        "breakdown": fb, "solution": sol_out, "prompt": public["prompt"],
+    }
+
+
+EV_TRAINER_SCHEMA = {
+    "name": "jane_street_ev_trainer",
+    "description": (
+        "Interactive trading-interview EV trainer. action='generate' returns a fresh, seed-reproducible puzzle "
+        "(conditional expectation with dice/coins/cards, dice and card optimal-stopping games, auction bidding "
+        "with adverse selection) priced as a trade, without the answer. action='check' grades a submission "
+        "(verdict tag, exact EV, size, proof structure) out of 100 and reveals the exact solution; action='solve' "
+        "reveals it directly. Verdicts: [PASS] if EV <= 0; [HEDGE] if EV > 0 but a stated variance limit is "
+        "breached (min-variance hedge ratio); else [TAKE] at half-Kelly contracts on the bankroll."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["generate", "check", "solve"], "description": "Default 'generate'."},
+            "category": {"type": "string", "enum": ["random", "conditional_expectation", "dice_stopping",
+                                                     "card_stopping", "auction"], "description": "generate: default random."},
+            "template": {"type": "string", "description": "generate: optional template (dice, coins, cards, reroll, pig, red_black, next_red, acquire, first_price)."},
+            "difficulty": {"type": "integer", "description": "generate: 1-3 (default 2)."},
+            "seed": {"type": "integer", "description": "generate: seed for a reproducible puzzle (default random)."},
+            "puzzle_id": {"type": "string", "description": "check/solve: id returned by generate."},
+            "verdict": {"type": "string", "description": "check: e.g. '[TAKE] 12.5', '[PASS]', '[HEDGE] first die 1'."},
+            "ev": {"type": ["number", "string"], "description": "check: EV per contract, exact fraction preferred ('17/4')."},
+            "size": {"type": "number", "description": "check: contracts (TAKE) or hedge ratio (HEDGE)."},
+            "proof": {"type": "string", "description": "check: the derivation (scored for the 5-part structure)."},
+        },
+        "required": [],
+    },
+}
+
+
+# ════════════════════════════════════════════════════════════════════════
 # Persona — elite desk quant + answer contract + enforcement hooks
 # ════════════════════════════════════════════════════════════════════════
 
@@ -2293,8 +3940,10 @@ half-Kelly).
 - Derive, don't assert: conditioning, linearity of expectation, symmetry, backward induction, \
 martingales / optional stopping, generating functions, LP duality. Exact fractions first, decimals second.
 - Compute with tools, never mental arithmetic: black_scholes, binomial_tree_american, heston_price, \
-monte_carlo_engine, ev_calculator, optimal_stopping, matrix_game_solver, avellaneda_stoikov_quotes, \
-order_book_metrics, order_flow_toxicity. Quote their numbers (with std errors for Monte Carlo).
+monte_carlo_engine, longstaff_schwartz_american, ev_calculator, optimal_stopping, matrix_game_solver, \
+avellaneda_stoikov_quotes, almgren_chriss_liquidation, order_book_metrics, order_flow_toxicity, \
+black_litterman_optimizer. Quote their numbers (with std errors for Monte Carlo). For interview drills use \
+jane_street_ev_trainer (generate -> solve -> check).
 - Verify two ways when cheap: limiting cases, bounds, parity / no-arbitrage, symmetry, simulation vs \
 closed form.
 - Separate edge (EV) from sizing (Kelly, risk limits). Flag adverse selection, model risk, liquidity.
@@ -2371,6 +4020,10 @@ order_flow_toxicity = _safe(_order_flow_toxicity)
 optimal_stopping = _safe(_optimal_stopping)
 matrix_game_solver = _safe(_matrix_game_solver)
 monte_carlo_engine = _safe(_monte_carlo_engine)
+almgren_chriss_liquidation = _safe(_almgren_chriss_liquidation)
+longstaff_schwartz_american = _safe(_longstaff_schwartz_american)
+black_litterman_optimizer = _safe(_black_litterman_optimizer)
+jane_street_ev_trainer = _safe(_jane_street_ev_trainer)
 
 _TOOLS = (
     ("black_scholes", BLACK_SCHOLES_SCHEMA, black_scholes, "📈"),
@@ -2383,6 +4036,10 @@ _TOOLS = (
     ("order_book_metrics", ORDER_BOOK_SCHEMA, order_book_metrics, "📊"),
     ("avellaneda_stoikov_quotes", AS_SCHEMA, avellaneda_stoikov_quotes, "💱"),
     ("order_flow_toxicity", TOXICITY_SCHEMA, order_flow_toxicity, "☣️"),
+    ("almgren_chriss_liquidation", ALMGREN_CHRISS_SCHEMA, almgren_chriss_liquidation, "🏦"),
+    ("longstaff_schwartz_american", LSM_SCHEMA, longstaff_schwartz_american, "🧮"),
+    ("black_litterman_optimizer", BLACK_LITTERMAN_SCHEMA, black_litterman_optimizer, "⚖️"),
+    ("jane_street_ev_trainer", EV_TRAINER_SCHEMA, jane_street_ev_trainer, "🎓"),
 )
 
 

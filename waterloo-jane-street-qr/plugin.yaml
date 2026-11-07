@@ -4,18 +4,23 @@ description: "Jane Street / Citadel style quantitative research assistant by a W
 entrypoint: "__init__.py"
 author: georg
 license: MIT
-tags: [quant, finance, options, volatility, probability, game-theory, market-making, market-microstructure]
+tags: [quant, finance, options, volatility, probability, game-theory, market-making, market-microstructure,
+       optimal-execution, portfolio-construction, interview-prep]
 provides_tools:
   - black_scholes
   - binomial_tree_american
   - heston_price
   - monte_carlo_engine
+  - longstaff_schwartz_american
   - ev_calculator
   - optimal_stopping
   - matrix_game_solver
   - order_book_metrics
   - avellaneda_stoikov_quotes
   - order_flow_toxicity
+  - almgren_chriss_liquidation
+  - black_litterman_optimizer
+  - jane_street_ev_trainer
 provides_hooks:
   - pre_llm_call
   - transform_llm_output
