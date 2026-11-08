@@ -1,3 +1,12 @@
+# Hermes Agent Plugin Hackathon by Nous Research
+
+<p align="left">
+  <img src="assets/hermes.jpg" alt="Hermes Agent" height="100">
+</p>
+
+The plugin below is built for the [Nous Research Hermes Agent Plugin Hackathon](https://x.com/NousResearch/status/2118094256438936062) 
+hosted by[Nous Research](https://nousresearch.com/).
+
 # Waterloo-Jane-Street-QR
 
 **A math-first quantitative research and trading-interview assistant, packaged as a [Hermes Agent](https://github.com/NousResearch/hermes-agent) v0.22.7 plugin.**
