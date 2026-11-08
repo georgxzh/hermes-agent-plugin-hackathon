@@ -1021,10 +1021,10 @@ The model calls `monte_carlo_engine`, answers in the five-part contract and ends
 cd waterloo-jane-street-qr
 
 # pytest (installed in the Hermes venv)
-~/.hermes/hermes-agent/venv/bin/python -m pytest -q tests/        # 79 passed, 2 skipped (no NumPy in the Hermes venv)
+~/.hermes/hermes-agent/venv/bin/python -m pytest -q tests/        # 81 passed (79 + 2 skipped if NumPy is absent)
 
 # standalone, no third-party deps
-python3 tests/test_plugin.py                                       # 79 passed, 2 skipped
+python3 tests/test_plugin.py                                       # 79 passed, 2 skipped (NumPy-only tests)
 
 # with NumPy available, the NumPy-backend tests run too
 /path/to/venv-with-numpy/bin/python tests/test_plugin.py          # 81 passed, 0 skipped
