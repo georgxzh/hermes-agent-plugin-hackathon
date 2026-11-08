@@ -5,7 +5,7 @@
 </p>
 
 The plugin below is built for the [Nous Research Hermes Agent Plugin Hackathon](https://x.com/NousResearch/status/2118094256438936062) 
-hosted by[Nous Research](https://nousresearch.com/).
+hosted by [Nous Research](https://nousresearch.com/).
 
 # Waterloo-Jane-Street-QR
 
