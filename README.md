@@ -3,7 +3,7 @@
 <p align="left">
   <img src="assets/hermes.jpg" alt="Hermes Agent" height="100" style="margin-right: 10px;">
   <img src="assets/janestreet.png" alt="Jane Street" height="100" style="margin-right: 10px;">
-  <img src="assets/waterloo.jpg" alt="Waterloo" height="100">
+  <img src="assets/waterloo.png" alt="Waterloo" height="100">
 </p>
 
 The plugin below is built for the [Nous Research Hermes Agent Plugin Hackathon](https://x.com/NousResearch/status/2118094256438936062) 
