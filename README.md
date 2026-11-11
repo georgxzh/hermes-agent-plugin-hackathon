@@ -305,7 +305,7 @@ C&=\frac{\kappa\theta}{\eta^2}\Big[(b-D)T-2\ln\frac{1-ge^{-DT}}{1-g}\Big],\quad
 **Pricing integral.** The call uses Lewis (2001)'s single integral, which needs only one CF evaluation per node and has a $1/(u^2+\tfrac14)$ damping factor:
 
 ```math
-C = S e^{-qT} - \frac{\sqrt{K}\,e^{-rT}}{\pi}\int_0^\infty \operatorname{Re}\!\Big[e^{-iu\ln K}\,\phi\!\big(u-\tfrac{i}{2}\big)\Big]\frac{du}{u^2+\tfrac14}
+C = S e^{-qT} - \frac{\sqrt{K}\,e^{-rT}}{\pi}\int_0^\infty \mathrm{Re}\Big[e^{-iu\ln K}\,\phi\!\big(u-\tfrac{i}{2}\big)\Big]\frac{du}{u^2+\tfrac14}
 ```
 
 **Quadrature**
@@ -657,7 +657,7 @@ x_k=X\,\frac{\sinh\big(\kappa(T-t_k)\big)}{\sinh(\kappa T)},\qquad \cosh(\kappa\
 
 **Numerics**
 
-- $\kappa$ uses the cancellation-free $\operatorname{acosh}(1+x)=\log1p\!\big(x+\sqrt{x(x+2)}\big)$.
+- $\kappa$ uses the cancellation-free $\mathrm{acosh}(1+x)=\log1p\!\big(x+\sqrt{x(x+2)}\big)$.
 - The sinh ratio is evaluated as $e^{-\kappa t}\,\mathrm{expm1}(-2\kappa(T-t))/\mathrm{expm1}(-2\kappa T)$, so it cannot overflow for urgent trades.
 - $\lambda=0$ reduces exactly to TWAP.
 - Inputs with $\tilde\eta\le0$ are rejected: the problem is ill-posed there and the "optimal" schedule would be arbitrage.
