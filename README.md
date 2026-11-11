@@ -15,7 +15,7 @@ hosted by [Nous Research](https://nousresearch.com/).
 
 Fourteen deterministic, validated pricing / execution / portfolio / probability / microstructure engines exposed as LLM tools, plus a system-prompt persona and two lifecycle hooks that force every answer into a desk-grade decision format: *state space → transitions → payoffs → EV → `[TAKE]` / `[PASS]` / `[HEDGE]`*.
 
-Built for the Hermes Plugin Hackathon to the standard you’d expect from a Waterloo Math/CS intern on a Jane Street–style trading desk, with an IMO / ICPC / Putnam background: derive it, compute it, verify it two ways, and size it.
+Built for the Hermes Plugin Hackathon to the standard you’d expect from a Waterloo Math/CS intern on a Jane Street–style trading desk, with an ICPC / Putnam background: That means every answer is derived, computed, verified two ways, and sized.
 
 | | |
 |---|---|
